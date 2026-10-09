@@ -559,21 +559,21 @@ impl Connection {
                     }
                 }
                 QueryType::Insert | QueryType::Update => {
-                    if table_ref.is_write_target && !infra.shadow {
-                        needs_shadow.push(table_name.clone());
+                    // All operations go through views now (INSTEAD OF triggers handle writes)
+                    if table_ref.is_write_target && !infra.view {
+                        needs_view.push(table_name.clone());
                     }
                     if !table_ref.is_write_target && !infra.view {
                         needs_view.push(table_name.clone());
                     }
                 }
                 QueryType::Delete => {
-                    if table_ref.is_write_target {
-                        if !infra.shadow {
-                            needs_shadow.push(table_name.clone());
-                        }
-                        if !infra.deleted {
-                            needs_deleted.push(table_name.clone());
-                        }
+                    // All operations go through views now
+                    if table_ref.is_write_target && !infra.view {
+                        needs_view.push(table_name.clone());
+                    }
+                    if table_ref.is_write_target && !infra.deleted {
+                        needs_deleted.push(table_name.clone());
                     }
                     if !table_ref.is_write_target && !infra.view {
                         needs_view.push(table_name.clone());
@@ -651,6 +651,51 @@ impl Connection {
         self.schema_manager
             .create_union_view(schema_name, "public", table_name, &pk)
             .await?;
+
+        // Update session's tables state in database so approval can find it
+        if let Some(session_id) = self.session_id {
+            self.update_session_table_state(session_id, table_name, &pk).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Update the session's tables state in the database
+    async fn update_session_table_state(
+        &self,
+        session_id: Uuid,
+        table_name: &str,
+        primary_key: &str,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+
+        // Use jsonb_set to add/update the table entry in the tables column
+        let table_state = serde_json::json!({
+            "shadow_created": true,
+            "view_created": true,
+            "primary_key": primary_key
+        });
+
+        client
+            .execute(
+                r#"
+                UPDATE _marlobu_sessions
+                SET tables = jsonb_set(
+                    COALESCE(tables, '{}'::jsonb),
+                    $2::text[],
+                    $3::jsonb
+                )
+                WHERE id = $1
+                "#,
+                &[&session_id, &vec![table_name.to_string()], &table_state],
+            )
+            .await?;
+
+        debug!(
+            session_id = %session_id,
+            table = table_name,
+            "Updated session table state in database"
+        );
 
         Ok(())
     }
@@ -754,6 +799,6 @@ mod tests {
         // INSERT should use shadow table
         let (sql, qt) = rewriter.rewrite("INSERT INTO users (name) VALUES ('test')").unwrap();
         assert_eq!(qt, QueryType::Insert);
-        assert!(sql.contains("session_abc123._shadow_users"));
+        assert!(sql.contains("session_abc123._view_users"));
     }
 }

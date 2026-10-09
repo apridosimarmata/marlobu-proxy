@@ -1,17 +1,18 @@
 //! Table name rewriting logic for schema isolation.
 //!
 //! Transforms table references based on query context:
-//! - Read operations (SELECT, FROM, JOIN) → `{schema}.{table}_view`
-//! - Write operations (INSERT, UPDATE, DELETE targets) → `{schema}.{table}`
+//! - Read operations (SELECT, FROM, JOIN) → `{schema}._view_{table}`
+//! - Write operations (INSERT, UPDATE, DELETE targets) → `{schema}._view_{table}`
+//!   (INSTEAD OF triggers on views handle copy-on-write to shadow tables)
 
 use sqlparser::ast::{ObjectName, Ident};
 
 /// Context for table rewriting - determines view vs shadow table routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewriteContext {
-    /// Reading data - route to view (sees base + shadow)
+    /// Reading data - route to view (sees shadow + base)
     Read,
-    /// Writing data - route to shadow table directly
+    /// Writing data - route to view (INSTEAD OF triggers handle copy-on-write)
     Write,
 }
 
@@ -19,19 +20,17 @@ pub enum RewriteContext {
 ///
 /// # Examples
 /// - `users` with Read context → `schema_123._view_users`
-/// - `users` with Write context → `schema_123._shadow_users`
+/// - `users` with Write context → `schema_123._view_users` (triggers handle shadow)
 /// - `public.orders` with Read context → `schema_123._view_orders`
 pub fn rewrite_table_name(
     table: &ObjectName,
     schema: &str,
-    context: RewriteContext,
+    _context: RewriteContext,
 ) -> ObjectName {
     let table_name = extract_table_name(table);
 
-    let rewritten_name = match context {
-        RewriteContext::Read => format!("_view_{}", table_name),
-        RewriteContext::Write => format!("_shadow_{}", table_name),
-    };
+    // All operations go through the view - INSTEAD OF triggers route writes to shadow
+    let rewritten_name = format!("_view_{}", table_name);
 
     ObjectName(vec![
         Ident::new(schema),
@@ -78,7 +77,7 @@ pub fn view_name_for_table(table: &str) -> String {
 
 /// Creates a shadow table name for a table.
 pub fn shadow_name_for_table(table: &str) -> String {
-    format!("_shadow_{}", table)
+    format!("_view_{}", table)
 }
 
 #[cfg(test)]
@@ -102,7 +101,7 @@ mod tests {
 
         assert_eq!(result.0.len(), 2);
         assert_eq!(result.0[0].value, "sandbox_123");
-        assert_eq!(result.0[1].value, "_shadow_users");
+        assert_eq!(result.0[1].value, "_view_users");
     }
 
     #[test]

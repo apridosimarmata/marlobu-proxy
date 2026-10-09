@@ -329,20 +329,42 @@ impl SchemaManager {
         let client = self.pool.get().await?;
 
         let view_name = format!(
-            "{}._view_{}",
+            "{}.{}",
             quote_ident(schema_name),
-            quote_ident(table_name)
+            quote_ident(&format!("_view_{}", table_name))
         );
-        let shadow_table = format!("{}.{}", quote_ident(schema_name), quote_ident(table_name));
+        let shadow_table = format!(
+            "{}.{}",
+            quote_ident(schema_name),
+            quote_ident(&format!("_shadow_{}", table_name))
+        );
         let source_table = format!("{}.{}", quote_ident(source_schema), quote_ident(table_name));
         let deletes_table = format!("{}._deletes", quote_ident(schema_name));
+
+        // Get all columns for the table (needed for view to exclude _mlb_* columns)
+        let columns: Vec<String> = client
+            .query(
+                r#"
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = $1 AND table_name = $2
+                ORDER BY ordinal_position
+                "#,
+                &[&source_schema, &table_name],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get::<_, String>("column_name"))
+            .collect();
+
+        let col_list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
 
         let create_view = format!(
             r#"
             CREATE OR REPLACE VIEW {} AS
-            SELECT * FROM {}
+            SELECT {} FROM {}
             UNION ALL
-            SELECT s.* FROM {} s
+            SELECT {} FROM {} s
             WHERE NOT EXISTS (
                 SELECT 1 FROM {} sh WHERE sh.{pk} = s.{pk}
             )
@@ -351,7 +373,9 @@ impl SchemaManager {
             )
             "#,
             view_name,
+            col_list,
             shadow_table,
+            col_list,
             source_table,
             shadow_table,
             deletes_table,
@@ -361,10 +385,133 @@ impl SchemaManager {
 
         client.execute(&create_view, &[]).await?;
 
+        let new_col_list = columns.iter().map(|c| format!("NEW.{}", quote_ident(c))).collect::<Vec<_>>().join(", ");
+        let update_set = columns.iter()
+            .filter(|c| c.as_str() != primary_key)
+            .map(|c| format!("{} = NEW.{}", quote_ident(c), quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Create INSTEAD OF UPDATE trigger function
+        let update_func = format!(
+            r#"
+            CREATE OR REPLACE FUNCTION {schema}.instead_update_{safe_table}()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                -- Copy row to shadow if not exists (copy-on-write)
+                INSERT INTO {schema}.{shadow_table} ({col_list}, _mlb_op, _mlb_ts)
+                SELECT {col_list}, 'UPDATE', NOW()
+                FROM {source_schema}.{table_name}
+                WHERE {pk} = OLD.{pk}
+                  AND NOT EXISTS (SELECT 1 FROM {schema}.{shadow_table} WHERE {pk} = OLD.{pk})
+                ON CONFLICT ({pk}) DO NOTHING;
+
+                -- Now update the shadow row
+                UPDATE {schema}.{shadow_table}
+                SET {update_set}, _mlb_op = 'UPDATE', _mlb_ts = NOW()
+                WHERE {pk} = OLD.{pk};
+
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+            schema = quote_ident(schema_name),
+            safe_table = safe_ident(table_name),
+            shadow_table = quote_ident(&format!("_shadow_{}", table_name)),
+            source_schema = quote_ident(source_schema),
+            table_name = quote_ident(table_name),
+            pk = quote_ident(primary_key),
+            col_list = col_list,
+            update_set = update_set,
+        );
+        client.execute(&update_func, &[]).await?;
+
+        let update_trigger = format!(
+            r#"
+            CREATE TRIGGER trg_instead_update_{safe_table}
+            INSTEAD OF UPDATE ON {view_name}
+            FOR EACH ROW EXECUTE FUNCTION {schema}.instead_update_{safe_table}()
+            "#,
+            safe_table = safe_ident(table_name),
+            view_name = view_name,
+            schema = quote_ident(schema_name),
+        );
+        client.execute(&update_trigger, &[]).await?;
+
+        // Create INSTEAD OF DELETE trigger function
+        let delete_func = format!(
+            r#"
+            CREATE OR REPLACE FUNCTION {schema}.instead_delete_{safe_table}()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                -- If row exists in shadow, delete it
+                DELETE FROM {schema}.{shadow_table} WHERE {pk} = OLD.{pk};
+
+                -- Record deletion (works for both shadow-only and prod rows)
+                INSERT INTO {schema}._deletes (table_name, row_id)
+                VALUES ('{table_name}', OLD.{pk}::TEXT)
+                ON CONFLICT (table_name, row_id) DO NOTHING;
+
+                RETURN OLD;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+            schema = quote_ident(schema_name),
+            safe_table = safe_ident(table_name),
+            shadow_table = quote_ident(&format!("_shadow_{}", table_name)),
+            table_name = table_name,
+            pk = quote_ident(primary_key),
+        );
+        client.execute(&delete_func, &[]).await?;
+
+        let delete_trigger = format!(
+            r#"
+            CREATE TRIGGER trg_instead_delete_{safe_table}
+            INSTEAD OF DELETE ON {view_name}
+            FOR EACH ROW EXECUTE FUNCTION {schema}.instead_delete_{safe_table}()
+            "#,
+            safe_table = safe_ident(table_name),
+            view_name = view_name,
+            schema = quote_ident(schema_name),
+        );
+        client.execute(&delete_trigger, &[]).await?;
+
+        // Create INSTEAD OF INSERT trigger function (for completeness)
+        let insert_func = format!(
+            r#"
+            CREATE OR REPLACE FUNCTION {schema}.instead_insert_{safe_table}()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                INSERT INTO {schema}.{shadow_table} ({col_list}, _mlb_op, _mlb_ts)
+                VALUES ({new_col_list}, 'INSERT', NOW());
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+            schema = quote_ident(schema_name),
+            safe_table = safe_ident(table_name),
+            shadow_table = quote_ident(&format!("_shadow_{}", table_name)),
+            col_list = col_list,
+            new_col_list = new_col_list,
+        );
+        client.execute(&insert_func, &[]).await?;
+
+        let insert_trigger = format!(
+            r#"
+            CREATE TRIGGER trg_instead_insert_{safe_table}
+            INSTEAD OF INSERT ON {view_name}
+            FOR EACH ROW EXECUTE FUNCTION {schema}.instead_insert_{safe_table}()
+            "#,
+            safe_table = safe_ident(table_name),
+            view_name = view_name,
+            schema = quote_ident(schema_name),
+        );
+        client.execute(&insert_trigger, &[]).await?;
+
         debug!(
             schema = schema_name,
             table = table_name,
-            "Created union view"
+            "Created union view with INSTEAD OF triggers"
         );
 
         Ok(())

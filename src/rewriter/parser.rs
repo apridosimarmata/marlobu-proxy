@@ -710,7 +710,7 @@ mod tests {
 
         assert_eq!(query_type, QueryType::Insert);
         // Target should be shadow table
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -721,7 +721,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("sandbox_123._shadow_users_archive"));
+        assert!(sql.contains("sandbox_123._view_users_archive"));
         // Source is view
         assert!(sql.contains("sandbox_123._view_users"));
     }
@@ -734,7 +734,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Update);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -745,7 +745,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("UPDATE sandbox_123._shadow_users"));
+        assert!(sql.contains("UPDATE sandbox_123._view_users"));
         // FROM clause is view
         assert!(sql.contains("sandbox_123._view_orders"));
     }
@@ -756,7 +756,7 @@ mod tests {
         let (sql, query_type) = r.rewrite("DELETE FROM users WHERE id = 1").unwrap();
 
         assert_eq!(query_type, QueryType::Delete);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -767,7 +767,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("FROM sandbox_123._shadow_users"));
+        assert!(sql.contains("FROM sandbox_123._view_users"));
         // USING is view
         assert!(sql.contains("sandbox_123._view_orders"));
     }
@@ -858,7 +858,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Insert);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("ON CONFLICT"));
         assert!(sql.contains("DO NOTHING"));
     }
@@ -871,7 +871,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Insert);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("ON CONFLICT"));
         assert!(sql.contains("DO UPDATE"));
     }
@@ -884,7 +884,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         // Subquery in DO UPDATE should use view
         assert!(sql.contains("sandbox_123._view_defaults"));
     }
@@ -897,7 +897,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Insert);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("RETURNING"));
     }
 
@@ -908,7 +908,7 @@ mod tests {
             "INSERT INTO users (name) VALUES ('John') RETURNING *"
         ).unwrap();
 
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("RETURNING *"));
     }
 
@@ -920,7 +920,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Update);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("RETURNING"));
     }
 
@@ -932,7 +932,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Delete);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("RETURNING"));
     }
 
@@ -944,7 +944,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         // Subquery in RETURNING should use view
         assert!(sql.contains("sandbox_123._view_orders"));
     }
@@ -956,7 +956,7 @@ mod tests {
             "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name WHERE users.active = true"
         ).unwrap();
 
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("DO UPDATE"));
         assert!(sql.contains("WHERE"));
     }
