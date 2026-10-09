@@ -1,5 +1,6 @@
 use serde::Serialize;
 use thiserror::Error;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Conflict {
@@ -25,6 +26,9 @@ pub enum ConflictError {
 
     #[error("Conflicts detected")]
     ConflictsDetected(Vec<Conflict>),
+
+    #[error("Primary key not found for table: {0}")]
+    PrimaryKeyNotFound(String),
 }
 
 /// Check for conflicts between expected state and current production state
@@ -164,6 +168,264 @@ pub async fn get_hash_columns(
     Ok(columns)
 }
 
+/// Quote an identifier to prevent SQL injection
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Capture the MD5 hash of a row at the time of first read/write
+/// This is used for conflict detection during approval
+pub async fn capture_row_hash(
+    client: &tokio_postgres::Client,
+    session_schema: &str,
+    table_name: &str,
+    pk_column: &str,
+    pk_value: &str,
+    source_schema: &str,
+) -> Result<Option<String>, ConflictError> {
+    debug!(
+        session_schema = session_schema,
+        table = table_name,
+        pk_column = pk_column,
+        pk_value = pk_value,
+        "Capturing row hash"
+    );
+
+    // Check if we already have a hash for this row (avoid duplicate captures)
+    let existing = client
+        .query_opt(
+            &format!(
+                r#"
+                SELECT hash FROM {}._mlb_row_hashes
+                WHERE table_name = $1 AND pk_value = $2
+                "#,
+                quote_ident(session_schema)
+            ),
+            &[&table_name, &pk_value],
+        )
+        .await?;
+
+    if let Some(row) = existing {
+        let hash: String = row.get("hash");
+        debug!(
+            table = table_name,
+            pk_value = pk_value,
+            hash = %hash,
+            "Row hash already captured"
+        );
+        return Ok(Some(hash));
+    }
+
+    // Calculate MD5 hash of the row from source schema
+    // Using ROW(t.*)::TEXT for a stable text representation of all columns
+    let hash_query = format!(
+        r#"
+        SELECT MD5(ROW(t.*)::TEXT) as hash
+        FROM {}.{} t
+        WHERE t.{} = $1
+        "#,
+        quote_ident(source_schema),
+        quote_ident(table_name),
+        quote_ident(pk_column)
+    );
+
+    let hash_result = client.query_opt(&hash_query, &[&pk_value]).await?;
+
+    let hash = match hash_result {
+        Some(row) => {
+            let h: String = row.get("hash");
+            h
+        }
+        None => {
+            // Row doesn't exist in source - this is valid for new inserts
+            debug!(
+                table = table_name,
+                pk_value = pk_value,
+                "Row not found in source schema (may be a new insert)"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Store the hash in _mlb_row_hashes
+    let insert_query = format!(
+        r#"
+        INSERT INTO {}._mlb_row_hashes (table_name, pk_value, hash, captured_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (table_name, pk_value) DO NOTHING
+        "#,
+        quote_ident(session_schema)
+    );
+
+    client
+        .execute(&insert_query, &[&table_name, &pk_value, &hash])
+        .await?;
+
+    info!(
+        table = table_name,
+        pk_value = pk_value,
+        hash = %hash,
+        "Captured row hash"
+    );
+
+    Ok(Some(hash))
+}
+
+/// Row hash conflict information
+#[derive(Debug, Clone, Serialize)]
+pub struct RowHashConflict {
+    pub table: String,
+    pub pk_value: String,
+    pub captured_hash: String,
+    pub current_hash: Option<String>,
+    pub conflict_type: ConflictType,
+}
+
+/// Check for conflicts between captured row hashes and current production state
+/// Returns a list of conflicts where rows have been modified or deleted since capture
+pub async fn check_row_hash_conflicts(
+    client: &tokio_postgres::Client,
+    session_schema: &str,
+    source_schema: &str,
+) -> Result<Vec<RowHashConflict>, ConflictError> {
+    info!(
+        session_schema = session_schema,
+        source_schema = source_schema,
+        "Checking for row hash conflicts"
+    );
+
+    let mut conflicts = Vec::new();
+
+    // Get all tracked row hashes
+    let tracked_rows = client
+        .query(
+            &format!(
+                r#"
+                SELECT table_name, pk_value, hash as captured_hash
+                FROM {}._mlb_row_hashes
+                ORDER BY table_name, pk_value
+                "#,
+                quote_ident(session_schema)
+            ),
+            &[],
+        )
+        .await?;
+
+    debug!(count = tracked_rows.len(), "Found tracked row hashes");
+
+    // Group by table for efficient querying
+    let mut table_rows: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+
+    for row in &tracked_rows {
+        let table_name: String = row.get("table_name");
+        let pk_value: String = row.get("pk_value");
+        let captured_hash: String = row.get("captured_hash");
+
+        table_rows
+            .entry(table_name)
+            .or_default()
+            .push((pk_value, captured_hash));
+    }
+
+    // Check each table's rows
+    for (table_name, rows) in table_rows {
+        // Get primary key column for this table
+        let pk_col = get_primary_key_column(client, source_schema, &table_name).await?;
+
+        for (pk_value, captured_hash) in rows {
+            // Calculate current hash
+            let current_hash_query = format!(
+                r#"
+                SELECT MD5(ROW(t.*)::TEXT) as hash
+                FROM {}.{} t
+                WHERE t.{}::TEXT = $1
+                "#,
+                quote_ident(source_schema),
+                quote_ident(&table_name),
+                quote_ident(&pk_col)
+            );
+
+            let current_result = client.query_opt(&current_hash_query, &[&pk_value]).await?;
+
+            match current_result {
+                Some(row) => {
+                    let current_hash: String = row.get("hash");
+                    if current_hash != captured_hash {
+                        warn!(
+                            table = %table_name,
+                            pk_value = %pk_value,
+                            captured_hash = %captured_hash,
+                            current_hash = %current_hash,
+                            "Row modified conflict detected"
+                        );
+                        conflicts.push(RowHashConflict {
+                            table: table_name.clone(),
+                            pk_value,
+                            captured_hash,
+                            current_hash: Some(current_hash),
+                            conflict_type: ConflictType::RowModified,
+                        });
+                    }
+                }
+                None => {
+                    warn!(
+                        table = %table_name,
+                        pk_value = %pk_value,
+                        "Row deleted conflict detected"
+                    );
+                    conflicts.push(RowHashConflict {
+                        table: table_name.clone(),
+                        pk_value,
+                        captured_hash,
+                        current_hash: None,
+                        conflict_type: ConflictType::RowDeleted,
+                    });
+                }
+            }
+        }
+    }
+
+    info!(
+        conflict_count = conflicts.len(),
+        "Completed row hash conflict check"
+    );
+
+    Ok(conflicts)
+}
+
+/// Get the primary key column name for a table
+async fn get_primary_key_column(
+    client: &tokio_postgres::Client,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<String, ConflictError> {
+    let row = client
+        .query_opt(
+            r#"
+            SELECT a.attname as column_name
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            JOIN pg_class c ON c.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE i.indisprimary
+              AND n.nspname = $1
+              AND c.relname = $2
+            LIMIT 1
+            "#,
+            &[&schema_name, &table_name],
+        )
+        .await?;
+
+    match row {
+        Some(r) => Ok(r.get("column_name")),
+        None => Err(ConflictError::PrimaryKeyNotFound(format!(
+            "{}.{}",
+            schema_name, table_name
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +442,59 @@ mod tests {
 
         let json = serde_json::to_string(&conflict).unwrap();
         assert!(json.contains("row_modified"));
+    }
+
+    #[test]
+    fn test_row_hash_conflict_serialization() {
+        let conflict = RowHashConflict {
+            table: "orders".to_string(),
+            pk_value: "123".to_string(),
+            captured_hash: "abc123def456".to_string(),
+            current_hash: Some("789xyz000111".to_string()),
+            conflict_type: ConflictType::RowModified,
+        };
+
+        let json = serde_json::to_string(&conflict).unwrap();
+        assert!(json.contains("row_modified"));
+        assert!(json.contains("orders"));
+        assert!(json.contains("123"));
+        assert!(json.contains("abc123def456"));
+        assert!(json.contains("789xyz000111"));
+    }
+
+    #[test]
+    fn test_row_hash_conflict_deleted_serialization() {
+        let conflict = RowHashConflict {
+            table: "users".to_string(),
+            pk_value: "42".to_string(),
+            captured_hash: "deadbeef".to_string(),
+            current_hash: None,
+            conflict_type: ConflictType::RowDeleted,
+        };
+
+        let json = serde_json::to_string(&conflict).unwrap();
+        assert!(json.contains("row_deleted"));
+        assert!(json.contains("\"current_hash\":null"));
+    }
+
+    #[test]
+    fn test_quote_ident_simple() {
+        assert_eq!(quote_ident("users"), "\"users\"");
+        assert_eq!(quote_ident("my_table"), "\"my_table\"");
+    }
+
+    #[test]
+    fn test_quote_ident_with_special_chars() {
+        assert_eq!(quote_ident("with space"), "\"with space\"");
+        assert_eq!(quote_ident("with\"quote"), "\"with\"\"quote\"");
+    }
+
+    #[test]
+    fn test_conflict_error_display() {
+        let err = ConflictError::PrimaryKeyNotFound("public.users".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Primary key not found for table: public.users"
+        );
     }
 }

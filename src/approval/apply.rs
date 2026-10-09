@@ -47,7 +47,11 @@ pub async fn apply_session(
     let conflicts = check_conflicts(client, schema_name, &conflict_checks).await
         .map_err(|e| match e {
             ConflictError::Database(e) => ApplyError::Database(e),
-            ConflictError::ConflictsDetected(c) => {
+            ConflictError::PrimaryKeyNotFound(_) => {
+                // Primary key not found during conflict check - treat as DB error
+                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+            }
+            ConflictError::ConflictsDetected(_) => {
                 // This shouldn't happen since check_conflicts returns Ok with conflicts
                 ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
             }

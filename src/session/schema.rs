@@ -76,6 +76,30 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Create the _mlb_row_hashes table for conflict detection
+    /// This table stores MD5 hashes of rows at the time they were first accessed
+    pub async fn create_hash_table(&self, schema_name: &str) -> SchemaResult<()> {
+        let client = self.pool.get().await?;
+
+        let create_hash_table = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}._mlb_row_hashes (
+                table_name VARCHAR(255) NOT NULL,
+                pk_value VARCHAR(255) NOT NULL,
+                hash VARCHAR(32) NOT NULL,
+                captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (table_name, pk_value)
+            )
+            "#,
+            quote_ident(schema_name)
+        );
+        client.execute(&create_hash_table, &[]).await?;
+
+        info!(schema = schema_name, "Created _mlb_row_hashes table");
+
+        Ok(())
+    }
+
     /// Drop session schema and all its contents
     pub async fn drop_session_schema(&self, schema_name: &str) -> SchemaResult<()> {
         let client = self.pool.get().await?;
