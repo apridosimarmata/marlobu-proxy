@@ -4,8 +4,8 @@
 //! to route reads through views and writes to shadow tables.
 
 use sqlparser::ast::{
-    DoUpdate, Expr, OnConflict, OnConflictAction, OnInsert, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor, TableWithJoins,
+    CopySource, DoUpdate, Expr, ObjectName, OnConflict, OnConflictAction, OnInsert, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -311,9 +311,6 @@ impl Rewriter {
             }
 
             // Block dangerous operations
-            Statement::Copy { .. } => {
-                Err(RewriterError::BlockedStatement("COPY".to_string()))
-            }
             Statement::SetRole { .. } => {
                 Err(RewriterError::BlockedStatement("SET ROLE".to_string()))
             }
@@ -409,6 +406,31 @@ impl Rewriter {
                 // RETURNING clause may have subqueries
                 if let Some(ref mut ret) = returning {
                     self.rewrite_select_items(ret);
+                }
+            }
+            Statement::Copy {
+                source,
+                to,
+                ..
+            } => {
+                // COPY TO (export): reads from view
+                // COPY FROM (import): writes directly to shadow (bypasses triggers)
+                let context = if *to {
+                    RewriteContext::Read
+                } else {
+                    RewriteContext::DirectWrite
+                };
+
+                match source {
+                    CopySource::Table { table_name, .. } => {
+                        if !should_skip_rewrite(table_name) {
+                            *table_name = rewrite_table_name(table_name, &self.schema, context);
+                        }
+                    }
+                    CopySource::Query(query) => {
+                        // COPY (SELECT ...) TO - rewrite the query
+                        self.rewrite_query(query, RewriteContext::Read);
+                    }
                 }
             }
             _ => {
@@ -786,8 +808,35 @@ mod tests {
     fn test_block_dangerous() {
         let r = rewriter();
 
-        assert!(r.rewrite("COPY users TO '/tmp/data.csv'").is_err());
         assert!(r.rewrite("SET ROLE admin").is_err());
+    }
+
+    #[test]
+    fn test_copy_to_uses_view() {
+        let r = rewriter();
+        let (sql, qt) = r.rewrite("COPY users TO STDOUT").unwrap();
+
+        assert_eq!(qt, QueryType::Other);
+        assert!(sql.contains("sandbox_123._view_users"));
+    }
+
+    #[test]
+    fn test_copy_from_uses_shadow() {
+        let r = rewriter();
+        // COPY FROM with file path
+        let (sql, qt) = r.rewrite("COPY users FROM '/tmp/data.csv'").unwrap();
+
+        assert_eq!(qt, QueryType::Other);
+        assert!(sql.contains("_shadow_users"), "Expected shadow table in: {}", sql);
+    }
+
+    #[test]
+    fn test_copy_query_to_stdout() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite("COPY (SELECT * FROM users) TO STDOUT").unwrap();
+
+        // The subquery should use view
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
