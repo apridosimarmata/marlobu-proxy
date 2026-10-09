@@ -12,17 +12,19 @@
 
 ---
 
-## Phase 1: Copy-on-Write Foundation (v0.2)
+## Phase 1: Copy-on-Write Foundation (v0.2) ✅
 *Make isolation actually work*
 
-- [ ] **Shadow tables** — Auto-create `_shadow_{table}` on first write
-- [ ] **Deleted tracking** — `_deleted_{table}` for DELETE operations
-- [ ] **Union views** — `CREATE VIEW {table} AS shadow UNION ALL (prod EXCEPT deleted)`
-- [ ] **Write interception** — INSERT/UPDATE/DELETE → redirect to shadow tables
-- [ ] **Read-through** — SELECT sees merged session + production data
-- [ ] **Hash tracking** — Store row hashes at fork time for conflict detection
+- [x] **Shadow tables** — Auto-create `_shadow_{table}` on first write (PR #5)
+- [x] **Deleted tracking** — `_deleted_{table}` for DELETE operations (PR #1)
+- [x] **Union views** — `CREATE VIEW {table} AS shadow UNION ALL (prod EXCEPT deleted)` (PR #2)
+- [x] **Write interception** — INSERT/UPDATE/DELETE → redirect to shadow tables
+- [x] **Read-through** — SELECT sees merged session + production data
+- [x] **Hash tracking** — Store row hashes at fork time for conflict detection (PR #5)
 
 **Exit criteria:** Can INSERT in session, SELECT sees it merged with prod, prod unchanged.
+
+**Status:** Phase 1 complete. Rewriter integrated into connection handler with dynamic infrastructure creation. Queries are analyzed, tables extracted, and views/shadow tables created on-demand before execution.
 
 ---
 

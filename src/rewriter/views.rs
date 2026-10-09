@@ -486,8 +486,8 @@ pub fn generate_deleted_table_sql(
 /// Generates DROP statements for sandbox cleanup.
 pub fn generate_cleanup_sql(schema: &str, table_name: &str) -> Vec<String> {
     vec![
-        format!("DROP VIEW IF EXISTS {}.{}_view CASCADE", schema, table_name),
-        format!("DROP TABLE IF EXISTS {}.{} CASCADE", schema, table_name),
+        format!("DROP VIEW IF EXISTS {}._view_{} CASCADE", schema, table_name),
+        format!("DROP TABLE IF EXISTS {}._shadow_{} CASCADE", schema, table_name),
         format!("DROP TABLE IF EXISTS {}._deleted_{} CASCADE", schema, table_name),
     ]
 }
@@ -530,7 +530,7 @@ mod tests {
         let table = sample_table();
         let sql = generate_view_sql("sandbox_123", "public", &table);
 
-        assert!(sql.contains("CREATE OR REPLACE VIEW sandbox_123.users_view"));
+        assert!(sql.contains("CREATE OR REPLACE VIEW sandbox_123._view_users"));
         assert!(sql.contains("FROM sandbox_123.users"));
         assert!(sql.contains("FROM public.users base"));
         assert!(sql.contains("shadow.id = base.id"));
@@ -576,7 +576,8 @@ mod tests {
 
         assert_eq!(stmts.len(), 3);
         assert!(stmts[0].contains("DROP VIEW"));
-        assert!(stmts[1].contains("DROP TABLE IF EXISTS sandbox_123.users"));
+        assert!(stmts[0].contains("_view_users"));
+        assert!(stmts[1].contains("DROP TABLE IF EXISTS sandbox_123._shadow_users"));
         assert!(stmts[2].contains("_deleted_users"));
     }
 

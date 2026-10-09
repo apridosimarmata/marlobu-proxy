@@ -2,4 +2,4 @@ pub mod parser;
 pub mod tables;
 pub mod views;
 
-pub use parser::{Rewriter, QueryType};
+pub use parser::{Rewriter, QueryType, QueryAnalysis, TableRef};

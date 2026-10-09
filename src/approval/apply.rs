@@ -23,6 +23,9 @@ pub enum ApplyError {
     #[error("Invalid data type: {0}")]
     InvalidDataType(String),
 
+    #[error("Primary key not found for table: {0}")]
+    PrimaryKeyNotFound(String),
+
     #[error("Unexpected conflicts detected")]
     UnexpectedConflicts,
 }
@@ -57,7 +60,7 @@ pub async fn apply_session(
                 // This shouldn't happen since check_conflicts returns Ok with conflicts
                 ApplyError::UnexpectedConflicts
             }
-            ConflictError::InvalidDataType(msg) => ApplyError::InvalidDataType(msg),
+            ConflictError::PrimaryKeyNotFound(table) => ApplyError::PrimaryKeyNotFound(table),
         })?;
 
     if !conflicts.is_empty() && !force {

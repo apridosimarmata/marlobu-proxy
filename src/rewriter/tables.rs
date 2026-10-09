@@ -18,9 +18,9 @@ pub enum RewriteContext {
 /// Rewrites a table name for the given schema and context.
 ///
 /// # Examples
-/// - `users` with Read context → `schema_123.users_view`
-/// - `users` with Write context → `schema_123.users`
-/// - `public.orders` with Read context → `schema_123.orders_view`
+/// - `users` with Read context → `schema_123._view_users`
+/// - `users` with Write context → `schema_123._shadow_users`
+/// - `public.orders` with Read context → `schema_123._view_orders`
 pub fn rewrite_table_name(
     table: &ObjectName,
     schema: &str,
@@ -29,8 +29,8 @@ pub fn rewrite_table_name(
     let table_name = extract_table_name(table);
 
     let rewritten_name = match context {
-        RewriteContext::Read => format!("{}_view", table_name),
-        RewriteContext::Write => table_name.to_string(),
+        RewriteContext::Read => format!("_view_{}", table_name),
+        RewriteContext::Write => format!("_shadow_{}", table_name),
     };
 
     ObjectName(vec![
@@ -73,7 +73,12 @@ pub fn qualify_table(schema: &str, table: &str) -> ObjectName {
 
 /// Creates a view name for a table.
 pub fn view_name_for_table(table: &str) -> String {
-    format!("{}_view", table)
+    format!("_view_{}", table)
+}
+
+/// Creates a shadow table name for a table.
+pub fn shadow_name_for_table(table: &str) -> String {
+    format!("_shadow_{}", table)
 }
 
 #[cfg(test)]
@@ -87,7 +92,7 @@ mod tests {
 
         assert_eq!(result.0.len(), 2);
         assert_eq!(result.0[0].value, "sandbox_123");
-        assert_eq!(result.0[1].value, "users_view");
+        assert_eq!(result.0[1].value, "_view_users");
     }
 
     #[test]
@@ -97,7 +102,7 @@ mod tests {
 
         assert_eq!(result.0.len(), 2);
         assert_eq!(result.0[0].value, "sandbox_123");
-        assert_eq!(result.0[1].value, "users");
+        assert_eq!(result.0[1].value, "_shadow_users");
     }
 
     #[test]
@@ -106,7 +111,7 @@ mod tests {
         let result = rewrite_table_name(&table, "sandbox_456", RewriteContext::Read);
 
         assert_eq!(result.0[0].value, "sandbox_456");
-        assert_eq!(result.0[1].value, "orders_view");
+        assert_eq!(result.0[1].value, "_view_orders");
     }
 
     #[test]

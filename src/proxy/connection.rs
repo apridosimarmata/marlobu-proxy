@@ -2,6 +2,8 @@
 
 use bytes::BytesMut;
 use std::collections::HashMap;
+use std::sync::Arc;
+use deadpool_postgres::Pool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
@@ -11,6 +13,8 @@ use crate::proxy::protocol::{
     self, encode_backend_message, encode_error, encode_parse, encode_query, encode_startup,
     parse_backend_message, parse_frontend_message, BackendMessage, FrontendMessage, StartupMessage,
 };
+use crate::rewriter::{Rewriter, QueryType, QueryAnalysis};
+use crate::session::schema::SchemaManager;
 
 /// Connection state in the proxy lifecycle
 #[derive(Debug, Clone, PartialEq)]
@@ -35,10 +39,16 @@ pub struct Connection {
     backend: Option<TcpStream>,
     /// Backend address to connect to
     backend_addr: String,
+    /// Database pool for infrastructure operations
+    pool: Arc<Pool>,
+    /// Schema manager for creating views/shadow tables
+    schema_manager: SchemaManager,
     /// Session ID extracted from marlobu_session parameter
     session_id: Option<Uuid>,
     /// Schema name for this session (will be resolved from session_id)
     schema_name: Option<String>,
+    /// SQL rewriter for this session
+    rewriter: Option<Rewriter>,
     /// Read buffer for client messages
     client_buffer: BytesMut,
     /// Read buffer for backend messages
@@ -47,21 +57,36 @@ pub struct Connection {
     state: ConnectionState,
     /// Original startup parameters from client
     startup_params: HashMap<String, String>,
+    /// Tables with infrastructure already ensured (to avoid repeated checks)
+    ensured_tables: HashMap<String, EnsuredInfra>,
+}
+
+/// Tracks what infrastructure has been ensured for a table
+#[derive(Default, Clone)]
+struct EnsuredInfra {
+    view: bool,
+    shadow: bool,
+    deleted: bool,
 }
 
 impl Connection {
     /// Create a new connection handler
-    pub fn new(client: TcpStream, backend_addr: String) -> Self {
+    pub fn new(client: TcpStream, backend_addr: String, pool: Arc<Pool>) -> Self {
+        let schema_manager = SchemaManager::new((*pool).clone());
         Self {
             client,
             backend: None,
             backend_addr,
+            pool,
+            schema_manager,
             session_id: None,
             schema_name: None,
+            rewriter: None,
             client_buffer: BytesMut::with_capacity(8192),
             backend_buffer: BytesMut::with_capacity(8192),
             state: ConnectionState::Initial,
             startup_params: HashMap::new(),
+            ensured_tables: HashMap::new(),
         }
     }
 
@@ -143,9 +168,11 @@ impl Connection {
         if let Some(session_str) = session_str {
             match Uuid::parse_str(&session_str) {
                 Ok(uuid) => {
+                    let schema = format!("session_{}", uuid.to_string().replace('-', "_"));
                     self.session_id = Some(uuid);
-                    self.schema_name = Some(format!("session_{}", uuid.to_string().replace('-', "_")));
-                    info!(session_id = %uuid, schema = ?self.schema_name, "Session identified");
+                    self.rewriter = Some(Rewriter::new(&schema));
+                    self.schema_name = Some(schema.clone());
+                    info!(session_id = %uuid, schema = %schema, "Session identified, rewriter initialized");
                 }
                 Err(e) => {
                     warn!(session = session_str, error = %e, "Invalid session UUID");
@@ -314,14 +341,14 @@ impl Connection {
                         return Ok(());
                     }
                     FrontendMessage::Query(query) => {
-                        let rewritten = rewrite_query_for_schema(&query, self.schema_name.as_deref());
+                        let rewritten = self.rewrite_query(&query).await;
                         debug!(original = %query, rewritten = %rewritten, "Query");
                         let encoded = encode_query(&rewritten);
                         let backend = self.backend.as_mut().unwrap();
                         backend.write_all(&encoded).await?;
                     }
                     FrontendMessage::Parse { name, query, param_types } => {
-                        let rewritten = rewrite_query_for_schema(&query, self.schema_name.as_deref());
+                        let rewritten = self.rewrite_query(&query).await;
                         debug!(original = %query, rewritten = %rewritten, "Parse");
                         let encoded = encode_parse(&name, &rewritten, &param_types);
                         let backend = self.backend.as_mut().unwrap();
@@ -371,23 +398,152 @@ impl Connection {
 
         Ok(())
     }
-}
 
-/// Rewrite SQL query for session isolation (free function to avoid borrow issues)
-/// TODO: Integrate with rewriter module
-fn rewrite_query_for_schema(query: &str, schema_name: Option<&str>) -> String {
-    if let Some(schema) = schema_name {
-        // Don't rewrite SET commands or empty queries
-        let trimmed = query.trim().to_uppercase();
-        if trimmed.starts_with("SET") || trimmed.is_empty() {
+    /// Rewrite a query using the session's rewriter, ensuring infrastructure exists
+    async fn rewrite_query(&mut self, query: &str) -> String {
+        // Skip empty queries and SET commands
+        let trimmed = query.trim();
+        if trimmed.is_empty() || trimmed.to_uppercase().starts_with("SET") {
             return query.to_string();
         }
 
-        // For v1: simple prefix with search_path
-        // TODO: Use proper SQL rewriter for table qualification
-        format!("SET search_path TO {}, public; {}", schema, query)
-    } else {
-        query.to_string()
+        // If we have a rewriter (session mode), use it
+        if let Some(ref rewriter) = self.rewriter {
+            match rewriter.analyze(query) {
+                Ok(analysis) => {
+                    // Ensure infrastructure exists for all referenced tables
+                    if let Err(e) = self.ensure_infrastructure(&analysis).await {
+                        warn!(error = %e, "Failed to ensure infrastructure, query may fail");
+                    }
+                    debug!(query_type = ?analysis.query_type, tables = ?analysis.tables, "Query analyzed");
+                    analysis.sql
+                }
+                Err(e) => {
+                    // Log error but fall back to passthrough for now
+                    warn!(error = %e, "Query rewrite failed, passing through");
+                    query.to_string()
+                }
+            }
+        } else {
+            // No session - pass through unchanged
+            query.to_string()
+        }
+    }
+
+    /// Ensure required infrastructure (views, shadow tables) exists for a query
+    async fn ensure_infrastructure(&mut self, analysis: &QueryAnalysis) -> anyhow::Result<()> {
+        let schema_name = match &self.schema_name {
+            Some(s) => s.clone(),
+            None => return Ok(()), // No session, nothing to ensure
+        };
+
+        // First pass: collect what needs to be done
+        let mut needs_view: Vec<String> = Vec::new();
+        let mut needs_shadow: Vec<String> = Vec::new();
+        let mut needs_deleted: Vec<String> = Vec::new();
+
+        for table_ref in &analysis.tables {
+            let table_name = &table_ref.name;
+            let infra = self.ensured_tables.get(table_name).cloned().unwrap_or_default();
+
+            match analysis.query_type {
+                QueryType::Select => {
+                    if !infra.view {
+                        needs_view.push(table_name.clone());
+                    }
+                }
+                QueryType::Insert | QueryType::Update => {
+                    if table_ref.is_write_target && !infra.shadow {
+                        needs_shadow.push(table_name.clone());
+                    }
+                    if !table_ref.is_write_target && !infra.view {
+                        needs_view.push(table_name.clone());
+                    }
+                }
+                QueryType::Delete => {
+                    if table_ref.is_write_target {
+                        if !infra.shadow {
+                            needs_shadow.push(table_name.clone());
+                        }
+                        if !infra.deleted {
+                            needs_deleted.push(table_name.clone());
+                        }
+                    }
+                    if !table_ref.is_write_target && !infra.view {
+                        needs_view.push(table_name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Second pass: create infrastructure (no borrows held)
+        for table_name in needs_view {
+            self.ensure_view(&schema_name, &table_name).await?;
+            let infra = self.ensured_tables.entry(table_name).or_default();
+            infra.view = true;
+            infra.shadow = true;
+            infra.deleted = true;
+        }
+
+        for table_name in needs_shadow {
+            self.ensure_shadow(&schema_name, &table_name).await?;
+            let infra = self.ensured_tables.entry(table_name).or_default();
+            infra.shadow = true;
+        }
+
+        for table_name in needs_deleted {
+            self.ensure_deleted(&schema_name, &table_name).await?;
+            let infra = self.ensured_tables.entry(table_name).or_default();
+            infra.deleted = true;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure shadow table exists for a table
+    async fn ensure_shadow(&self, schema_name: &str, table_name: &str) -> anyhow::Result<()> {
+        debug!(schema = schema_name, table = table_name, "Ensuring shadow table");
+        self.schema_manager
+            .create_shadow_table(schema_name, "public", table_name)
+            .await?;
+        Ok(())
+    }
+
+    /// Ensure deleted tracking table exists for a table
+    async fn ensure_deleted(&self, schema_name: &str, table_name: &str) -> anyhow::Result<()> {
+        debug!(schema = schema_name, table = table_name, "Ensuring deleted table");
+        self.schema_manager
+            .create_deleted_table(schema_name, "public", table_name)
+            .await?;
+        Ok(())
+    }
+
+    /// Ensure view exists for a table (creates shadow + deleted + view)
+    async fn ensure_view(&self, schema_name: &str, table_name: &str) -> anyhow::Result<()> {
+        debug!(schema = schema_name, table = table_name, "Ensuring view");
+
+        // Create shadow table first
+        self.schema_manager
+            .create_shadow_table(schema_name, "public", table_name)
+            .await?;
+
+        // Create deleted table
+        self.schema_manager
+            .create_deleted_table(schema_name, "public", table_name)
+            .await?;
+
+        // Get primary key for view creation
+        let pk = self.schema_manager
+            .get_primary_key("public", table_name)
+            .await?;
+
+        // Create union view
+        self.schema_manager
+            .create_union_view(schema_name, "public", table_name, &pk)
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -460,25 +616,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rewrite_query_with_schema() {
-        let result = rewrite_query_for_schema("SELECT * FROM users", Some("session_abc123"));
-        assert!(result.contains("SET search_path TO session_abc123"));
-        assert!(result.contains("SELECT * FROM users"));
-    }
-
-    #[test]
-    fn test_rewrite_query_without_schema() {
-        let result = rewrite_query_for_schema("SELECT * FROM users", None);
-        assert_eq!(result, "SELECT * FROM users");
-    }
-
-    #[test]
-    fn test_rewrite_skips_set_commands() {
-        let result = rewrite_query_for_schema("SET timezone TO 'UTC'", Some("session_abc123"));
-        assert_eq!(result, "SET timezone TO 'UTC'");
-    }
-
-    #[test]
     fn test_extract_option_value() {
         let opts = "-c marlobu_session=abc-123 -c other=xyz";
         assert_eq!(extract_option_value(opts, "marlobu_session"), Some("abc-123".to_string()));
@@ -493,5 +630,21 @@ mod tests {
 
         let opts2 = "-c marlobu_session=abc-123";
         assert_eq!(strip_option_value(opts2, "marlobu_session"), "");
+    }
+
+    #[test]
+    fn test_rewriter_integration() {
+        // Test that the Rewriter properly rewrites queries
+        let rewriter = Rewriter::new("session_abc123");
+
+        // SELECT should use view
+        let (sql, qt) = rewriter.rewrite("SELECT * FROM users").unwrap();
+        assert_eq!(qt, QueryType::Select);
+        assert!(sql.contains("session_abc123._view_users"));
+
+        // INSERT should use shadow table
+        let (sql, qt) = rewriter.rewrite("INSERT INTO users (name) VALUES ('test')").unwrap();
+        assert_eq!(qt, QueryType::Insert);
+        assert!(sql.contains("session_abc123._shadow_users"));
     }
 }

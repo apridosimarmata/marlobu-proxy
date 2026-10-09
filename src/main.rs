@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let pool = pg_config.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)?;
 
     // Create and initialize session manager
-    let session_manager = Arc::new(session::SessionManager::new(pool, config.session_ttl_seconds));
+    let session_manager = Arc::new(session::SessionManager::new(pool.clone(), config.session_ttl_seconds));
     session_manager.init().await?;
 
     // Extract backend address from DATABASE_URL
@@ -53,8 +53,9 @@ async fn main() -> Result<()> {
 
     // Start proxy server
     let proxy_addr = config.proxy_addr.clone();
+    let proxy_pool = pool.clone();
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::start_server(&proxy_addr, &backend_addr).await {
+        if let Err(e) = proxy::start_server(&proxy_addr, &backend_addr, proxy_pool).await {
             tracing::error!("Proxy server error: {}", e);
         }
     });
