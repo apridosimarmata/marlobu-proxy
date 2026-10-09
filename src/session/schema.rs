@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use deadpool_postgres::Pool;
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
@@ -750,7 +751,7 @@ impl SchemaManager {
 
         let pk_column_defs: Vec<String> = pk_columns
             .iter()
-            .map(|col| format!("{} {}", quote_ident(&col.name), &col.data_type))
+            .map(|col| format!("{} {}", quote_ident(&col.name), col.data_type))
             .collect();
 
         let pk_column_names: Vec<String> = pk_columns

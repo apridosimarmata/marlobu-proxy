@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::manual_strip)]
 //! Per-connection state machine for Postgres wire protocol proxy.
 
 use bytes::BytesMut;
@@ -275,7 +279,7 @@ impl Connection {
                     if let FrontendMessage::Password(payload) = msg {
                         // Forward password to backend
                         let mut pw_msg = BytesMut::new();
-                        pw_msg.extend_from_slice(&[b'p']);
+                        pw_msg.extend_from_slice(b"p");
                         pw_msg.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
                         pw_msg.extend_from_slice(&payload);
                         backend.write_all(&pw_msg).await?;
@@ -295,7 +299,7 @@ impl Connection {
                     while let Some(msg) = parse_frontend_message(&mut self.client_buffer)? {
                         if let FrontendMessage::Password(payload) = msg {
                             let mut pw_msg = BytesMut::new();
-                            pw_msg.extend_from_slice(&[b'p']);
+                            pw_msg.extend_from_slice(b"p");
                             pw_msg.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
                             pw_msg.extend_from_slice(&payload);
                             backend.write_all(&pw_msg).await?;
@@ -562,7 +566,7 @@ impl Connection {
 
         // First pass: collect what needs to be done
         let mut needs_view: Vec<String> = Vec::new();
-        let mut needs_shadow: Vec<String> = Vec::new();
+        let needs_shadow: Vec<String> = Vec::new();
         let mut needs_deleted: Vec<String> = Vec::new();
 
         for table_ref in &analysis.tables {
@@ -574,10 +578,8 @@ impl Connection {
                 .unwrap_or_default();
 
             match analysis.query_type {
-                QueryType::Select => {
-                    if !infra.view {
-                        needs_view.push(table_name.clone());
-                    }
+                QueryType::Select if !infra.view => {
+                    needs_view.push(table_name.clone());
                 }
                 QueryType::Insert | QueryType::Update => {
                     // All operations go through views now (INSTEAD OF triggers handle writes)

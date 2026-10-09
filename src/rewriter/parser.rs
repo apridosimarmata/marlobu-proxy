@@ -1,11 +1,12 @@
+#![allow(dead_code)]
 //! SQL query rewriter for sandbox isolation.
 //!
 //! Parses incoming SQL, classifies query type, and rewrites table references
 //! to route reads through views and writes to shadow tables.
 
 use sqlparser::ast::{
-    CopySource, DoUpdate, Expr, ObjectName, OnConflict, OnConflictAction, OnInsert, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    CopySource, DoUpdate, Expr, OnConflict, OnConflictAction, OnInsert, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -564,10 +565,8 @@ impl Rewriter {
     /// Rewrites a table factor (table reference, subquery, etc.).
     fn rewrite_table_factor(&self, factor: &mut TableFactor, context: RewriteContext) {
         match factor {
-            TableFactor::Table { name, .. } => {
-                if !should_skip_rewrite(name) {
-                    *name = rewrite_table_name(name, &self.schema, context);
-                }
+            TableFactor::Table { name, .. } if !should_skip_rewrite(name) => {
+                *name = rewrite_table_name(name, &self.schema, context);
             }
             TableFactor::Derived { subquery, .. } => {
                 self.rewrite_query(subquery, context);

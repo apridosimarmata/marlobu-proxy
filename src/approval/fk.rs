@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Foreign key constraint validation at approval time.
 //!
 //! Validates that shadow table changes won't violate FK constraints when applied to production.
@@ -241,7 +242,7 @@ async fn check_missing_references(
     // Validate and quote all identifiers
     let session_schema_q = quote_ident(session_schema)?;
     let source_schema_q = quote_ident(source_schema)?;
-    let source_table_q = quote_ident(&fk.source_table)?;
+    let _source_table_q = quote_ident(&fk.source_table)?;
     let target_table_q = quote_ident(&fk.target_table)?;
     let shadow_source_q = quote_ident(&format!("_shadow_{}", fk.source_table))?;
     let shadow_target_q = quote_ident(&format!("_shadow_{}", fk.target_table))?;
@@ -400,7 +401,7 @@ async fn check_orphaned_references(
     let session_schema_q = quote_ident(session_schema)?;
     let source_schema_q = quote_ident(source_schema)?;
     let source_table_q = quote_ident(&fk.source_table)?;
-    let target_table_q = quote_ident(&fk.target_table)?;
+    let _target_table_q = quote_ident(&fk.target_table)?;
     let deleted_target_q = quote_ident(&format!("_deleted_{}", fk.target_table))?;
     let deleted_source_q = quote_ident(&format!("_deleted_{}", fk.source_table))?;
 

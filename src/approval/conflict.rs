@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use serde::Serialize;
 use thiserror::Error;
 use tracing::{debug, info, warn};

@@ -194,7 +194,7 @@ pub async fn get_session_mutations(
     }
 
     // Sort all mutations by timestamp
-    mutations.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    mutations.sort_by_key(|a| a.timestamp);
 
     debug!(
         schema = schema_name,

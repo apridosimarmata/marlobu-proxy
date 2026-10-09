@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Table name rewriting logic for schema isolation.
 //!
 //! Transforms table references based on query context:

@@ -128,6 +128,5 @@ mod tests {
     #[test]
     fn test_proxy_server_basic() {
         // Basic sanity test - actual server tests require integration testing
-        assert!(true);
     }
 }

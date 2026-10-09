@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::approval::conflict::{check_row_hash_conflicts, ConflictType};
 use crate::approval::diff::{generate_session_diff, SessionDiff};
-use crate::approval::fk::{validate_fk_constraints, FkViolation, FkViolationType};
+use crate::approval::fk::{validate_fk_constraints, FkViolationType};
 use crate::session::{get_session_mutations, Session, SessionManager, SessionStatus};
 
 // ============================================================================
