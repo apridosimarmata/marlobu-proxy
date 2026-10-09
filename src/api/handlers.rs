@@ -22,6 +22,8 @@ use crate::session::{Session, SessionManager, SessionStatus};
 #[derive(Clone)]
 pub struct AppState {
     pub session_manager: Arc<SessionManager>,
+    /// Source schema for production data (default: "public")
+    pub source_schema: String,
 }
 
 // ============================================================================

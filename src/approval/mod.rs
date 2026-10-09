@@ -1,3 +1,4 @@
-pub mod conflict;
 pub mod apply;
+pub mod conflict;
+pub mod diff;
 pub mod webhook;
