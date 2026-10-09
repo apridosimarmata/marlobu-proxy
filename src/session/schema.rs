@@ -478,6 +478,11 @@ impl SchemaManager {
             return Ok((full_table_name, pk_columns));
         }
 
+        // Revalidate data_type immediately before SQL interpolation
+        for col in &pk_columns {
+            validate_pg_data_type(&col.data_type)?;
+        }
+
         let pk_column_defs: Vec<String> = pk_columns
             .iter()
             .map(|col| format!("{} {}", quote_ident(&col.name), &col.data_type))
@@ -606,6 +611,11 @@ impl SchemaManager {
             )));
         }
 
+        // Revalidate data_type immediately before SQL interpolation
+        for col in &pk_columns {
+            validate_pg_data_type(&col.data_type)?;
+        }
+
         // Use explicit casts to handle non-text PKs (integers, UUIDs, etc.)
         let placeholders: Vec<String> = pk_columns
             .iter()
@@ -658,7 +668,7 @@ fn validate_pg_data_type(data_type: &str) -> Result<(), SchemaError> {
     // Check for SQL keywords as whole words (word boundaries), not substrings.
     // This allows valid types like tsvector, tsquery which contain "select" as substring.
     let lower = trimmed.to_lowercase();
-    let forbidden_keywords = ["drop", "delete", "insert", "update", "select", "exec", "execute", "alter", "create", "grant", "revoke"];
+    let forbidden_keywords = ["drop", "delete", "insert", "update", "select", "exec", "execute", "alter", "create", "grant", "revoke", "union", "from", "join", "where", "having", "group", "order"];
     for keyword in &forbidden_keywords {
         if is_standalone_word(&lower, keyword) {
             return Err(SchemaError::InvalidDataType(data_type.to_string()));
