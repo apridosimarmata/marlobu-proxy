@@ -155,17 +155,20 @@ async fn generate_table_diff(
     let pk_column = get_primary_key_column(client, source_schema, table_name).await?;
     let shadow_table = format!(
         "{}.{}",
-        quote_ident(schema_name),
-        quote_ident(&format!("_shadow_{}", table_name))
+        safe_quote_ident(schema_name)?,
+        safe_quote_ident(&format!("_shadow_{}", table_name))?
     );
     let source_table = format!(
         "{}.{}",
-        quote_ident(source_schema),
-        quote_ident(table_name)
+        safe_quote_ident(source_schema)?,
+        safe_quote_ident(table_name)?
     );
 
     let columns = get_table_columns(client, source_schema, table_name).await?;
-    let column_list: Result<Vec<String>, DiffError> = columns.iter().map(|c| safe_quote_ident(c)).collect();
+    let column_list: Result<Vec<String>, DiffError> = columns
+        .iter()
+        .map(|c| safe_quote_ident(c))
+        .collect();
     let column_list = column_list?.join(", ");
 
     // Find INSERTs
@@ -183,11 +186,17 @@ async fn generate_table_diff(
         columns = column_list,
         shadow = shadow_table,
         source = source_table,
-        pk = quote_ident(&pk_column),
+        pk = safe_quote_ident(&pk_column)?,
     );
 
     let insert_rows = client.query(&insert_query, &[]).await?;
     let inserts: Vec<serde_json::Value> = insert_rows.iter().map(|r| r.get("data")).collect();
+
+    debug!(
+        table = table_name,
+        insert_count = inserts.len(),
+        "Found inserts"
+    );
 
     // Find UPDATEs
     let update_query = format!(
@@ -205,7 +214,7 @@ async fn generate_table_diff(
         columns = column_list,
         shadow = shadow_table,
         source = source_table,
-        pk = quote_ident(&pk_column),
+        pk = safe_quote_ident(&pk_column)?,
     );
 
     let update_rows = client.query(&update_query, &[]).await?;
@@ -270,8 +279,8 @@ async fn get_deletes(
 
     let deleted_table = format!(
         "{}.{}",
-        quote_ident(schema_name),
-        quote_ident(&deleted_table_name)
+        safe_quote_ident(schema_name)?,
+        safe_quote_ident(&deleted_table_name)?
     );
     let source_table = format!(
         "{}.{}",
