@@ -18,7 +18,7 @@ use crate::proxy::protocol::{
     self, encode_backend_message, encode_error, encode_parse, encode_query, encode_startup,
     parse_backend_message, parse_frontend_message, BackendMessage, FrontendMessage, StartupMessage,
 };
-use crate::rewriter::{QueryAnalysis, QueryCache, QueryType, Rewriter, TableRef};
+use crate::rewriter::{QueryAnalysis, QueryCache, QueryType, Rewriter};
 use crate::session::schema::SchemaManager;
 
 /// Default buffer size for connection I/O (16KB for better throughput).
@@ -595,7 +595,7 @@ impl Connection {
     async fn ensure_infrastructure_for_tables(
         &mut self,
         table_names: &[String],
-        write_tables: &[String],
+        _write_tables: &[String],
     ) -> anyhow::Result<()> {
         let schema_name = match &self.schema_name {
             Some(s) => s.clone(),
