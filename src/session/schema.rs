@@ -34,6 +34,9 @@ pub enum SchemaError {
 
     #[error("Primary key not found for table: {0}")]
     PrimaryKeyNotFound(String),
+
+    #[error("Primary key value count mismatch: {0}")]
+    PrimaryKeyValueMismatch(String),
 }
 
 pub type SchemaResult<T> = Result<T, SchemaError>;
@@ -398,7 +401,7 @@ impl SchemaManager {
             .await?;
 
         if rows.is_empty() {
-            return Err(SchemaError::PrimaryKeyNotFound(format!(
+            return Err(SchemaError::PrimaryKeyValueMismatch(format!(
                 "{}.{}",
                 source_schema, table_name
             )));
@@ -554,8 +557,8 @@ impl SchemaManager {
         };
 
         if values.len() != pk_columns.len() {
-            return Err(SchemaError::PrimaryKeyNotFound(format!(
-                "Expected {} PK values for {}.{}, got {}",
+            return Err(SchemaError::PrimaryKeyValueMismatch(format!(
+                "PK value count mismatch: expected {} values for {}.{}, got {}",
                 pk_columns.len(),
                 source_schema,
                 table_name,

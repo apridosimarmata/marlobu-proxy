@@ -19,6 +19,12 @@ pub enum ApplyError {
 
     #[error("Session not in pending_review status")]
     InvalidStatus,
+
+    #[error("Primary key not found for table: {0}")]
+    PrimaryKeyNotFound(String),
+
+    #[error("Unexpected conflict state")]
+    UnexpectedConflictState,
 }
 
 /// Apply all staged changes from a session to production
@@ -47,12 +53,12 @@ pub async fn apply_session(
     let conflicts = check_conflicts(client, schema_name, &conflict_checks).await
         .map_err(|e| match e {
             ConflictError::Database(e) => ApplyError::Database(e),
-            ConflictError::ConflictsDetected(c) => {
+            ConflictError::ConflictsDetected(_) => {
                 // This shouldn't happen since check_conflicts returns Ok with conflicts
-                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+                ApplyError::UnexpectedConflictState
             }
             ConflictError::PrimaryKeyNotFound(table) => {
-                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+                ApplyError::PrimaryKeyNotFound(table)
             }
         })?;
 
