@@ -360,43 +360,89 @@ async fn apply_shadow_to_production(
         let pk = &table_state.primary_key;
         let schema = &session.schema_name;
 
-        // Apply INSERTs (rows in shadow not in prod)
-        let insert_sql = format!(
-            r#"
-            INSERT INTO public."{table}"
-            SELECT s.* FROM "{schema}"."{table}" s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
-            )
-            "#,
-            schema = schema,
-            table = table_name,
-            pk = pk,
-        );
-        let inserted = client.execute(&insert_sql, &[]).await?;
-        total_applied += inserted as usize;
-
-        // Apply UPDATEs (rows in both shadow and prod)
-        // Get columns for update
-        let columns: Vec<String> = client
+        // Get all columns and detect sequence-backed ones
+        let column_info: Vec<(String, bool)> = client
             .query(
                 r#"
-                SELECT column_name
+                SELECT
+                    column_name,
+                    COALESCE(column_default LIKE 'nextval%', false) as is_sequence
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND table_name = $1
-                  AND column_name != $2
                 ORDER BY ordinal_position
                 "#,
-                &[&table_name, &pk],
+                &[&table_name],
             )
             .await?
             .iter()
-            .map(|r| r.get("column_name"))
+            .map(|r| (r.get("column_name"), r.get("is_sequence")))
             .collect();
 
-        if !columns.is_empty() {
-            let set_clause = columns
+        let all_columns: Vec<&str> = column_info.iter().map(|(c, _)| c.as_str()).collect();
+        let is_pk_sequence = column_info.iter().any(|(c, is_seq)| c == pk && *is_seq);
+
+        // Apply INSERTs (rows in shadow not in prod)
+        // If PK is sequence-backed, exclude it so Postgres assigns fresh IDs
+        if is_pk_sequence {
+            let insert_columns: Vec<&str> = all_columns.iter()
+                .filter(|c| *c != pk)
+                .copied()
+                .collect();
+            let col_list = insert_columns.iter()
+                .map(|c| format!(r#""{}""#, c))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let insert_sql = format!(
+                r#"
+                INSERT INTO public."{table}" ({col_list})
+                SELECT {col_list} FROM "{schema}"."_shadow_{table}" s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+                )
+                "#,
+                schema = schema,
+                table = table_name,
+                pk = pk,
+                col_list = col_list,
+            );
+            let inserted = client.execute(&insert_sql, &[]).await?;
+            total_applied += inserted as usize;
+
+            if inserted > 0 {
+                tracing::info!(
+                    table = %table_name,
+                    count = inserted,
+                    "Inserted rows with fresh sequence IDs"
+                );
+            }
+        } else {
+            // Non-sequence PK: copy IDs directly
+            let insert_sql = format!(
+                r#"
+                INSERT INTO public."{table}"
+                SELECT s.* FROM "{schema}"."_shadow_{table}" s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+                )
+                "#,
+                schema = schema,
+                table = table_name,
+                pk = pk,
+            );
+            let inserted = client.execute(&insert_sql, &[]).await?;
+            total_applied += inserted as usize;
+        }
+
+        // Apply UPDATEs (rows in both shadow and prod)
+        let non_pk_columns: Vec<&str> = all_columns.iter()
+            .filter(|c| *c != pk)
+            .copied()
+            .collect();
+
+        if !non_pk_columns.is_empty() {
+            let set_clause = non_pk_columns
                 .iter()
                 .map(|col| format!(r#""{col}" = s."{col}""#))
                 .collect::<Vec<_>>()
@@ -406,7 +452,7 @@ async fn apply_shadow_to_production(
                 r#"
                 UPDATE public."{table}" p
                 SET {set_clause}
-                FROM "{schema}"."{table}" s
+                FROM "{schema}"."_shadow_{table}" s
                 WHERE p."{pk}" = s."{pk}"
                 "#,
                 schema = schema,
@@ -418,20 +464,20 @@ async fn apply_shadow_to_production(
             total_applied += updated as usize;
         }
 
-        // Apply DELETEs (check _mlb_deletes table if it exists)
+        // Apply DELETEs (check _deleted_{table} table if it exists)
         let delete_sql = format!(
             r#"
             DELETE FROM public."{table}"
             WHERE "{pk}"::text IN (
-                SELECT pk_value FROM "{schema}"._mlb_deletes WHERE table_name = $1
+                SELECT "{pk}"::text FROM "{schema}"."_deleted_{table}"
             )
             "#,
             schema = schema,
             table = table_name,
             pk = pk,
         );
-        // Ignore error if _mlb_deletes doesn't exist
-        if let Ok(deleted) = client.execute(&delete_sql, &[&table_name]).await {
+        // Ignore error if _deleted table doesn't exist
+        if let Ok(deleted) = client.execute(&delete_sql, &[]).await {
             total_applied += deleted as usize;
         }
     }
