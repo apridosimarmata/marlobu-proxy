@@ -14,7 +14,7 @@ impl Config {
             proxy_addr: std::env::var("PROXY_ADDR").unwrap_or_else(|_| "0.0.0.0:5433".into()),
             api_addr: std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5432/marlobu".into()),
+                .unwrap_or_else(|_| "postgresql://postgres@localhost:5432/marlobu".into()),
             session_ttl_seconds: std::env::var("SESSION_TTL_SECONDS")
                 .ok()
                 .and_then(|s| s.parse().ok())
