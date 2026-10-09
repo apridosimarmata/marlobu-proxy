@@ -61,21 +61,37 @@
 
 ---
 
-## Phase 4: Production Hardening (v0.5)
+## Phase 4: Production Hardening (v0.5) ✅
 *Ready for real workloads*
 
 - [x] **Connection pooling** — PgBouncer compatibility via SET marlobu.session (PR #15)
-- [x] **Performance** — Query cache (LRU), parallel infra creation, 16KB buffers (PR #19)
+- [x] **Performance** — LRU query cache, parallel infra creation, 16KB buffers (PR #19)
 - [x] **Sequence handling** — Prevent ID collisions on approval (PR #14)
 - [x] **Foreign keys** — Validate constraints at approval time (PR #15)
 - [ ] **Large objects** — BLOB/TOAST support
 - [x] **COPY protocol** — Bulk import/export (PR #16)
 - [x] **Graceful shutdown** — Drain connections, signal handling (PR #17)
 - [x] **Observability** — Prometheus metrics, cache hit/miss tracking (PR #18)
+- [x] **Session expiration** — PendingReview sessions now expire correctly (PR #21)
 
 **Exit criteria:** Can run production workload for 24h without issues.
 
-**Status:** Phase 4 nearly complete. All core hardening done: PgBouncer compatibility, query caching with LRU eviction, parallel infrastructure creation, sequence handling, FK validation, COPY protocol, graceful shutdown, Prometheus metrics. Remaining: large objects (BLOB/TOAST).
+**Status:** Phase 4 complete. All core hardening done. Only large objects (BLOB/TOAST) deferred to future release.
+
+---
+
+## Phase 4.5: Open Source Release (v0.5.1) ✅
+*Ship it*
+
+- [x] **LICENSE** — MIT license (PR #20)
+- [x] **CI** — GitHub Actions for fmt, clippy, test (PR #20)
+- [x] **CONTRIBUTING.md** — Contribution guidelines (PR #20)
+- [x] **README** — Professional documentation with ASCII logo, API reference, examples (PR #22)
+- [x] **Pre-push hooks** — Local CI checks before push
+- [ ] **GitHub Release** — Tag v0.5.0, release notes
+- [ ] **Docker image** — Published to ghcr.io
+
+**Status:** Ready to tag v0.5.0 release.
 
 ---
 
