@@ -11,14 +11,14 @@ lazy_static! {
         "marlobu_proxy_connections_active",
         "Number of active proxy connections"
     )
-    .unwrap();
+    .expect("failed to register PROXY_CONNECTIONS_ACTIVE metric");
 
     pub static ref PROXY_CONNECTIONS_TOTAL: CounterVec = register_counter_vec!(
         "marlobu_proxy_connections_total",
         "Total number of proxy connections",
         &["status"]  // "accepted", "rejected", "error"
     )
-    .unwrap();
+    .expect("failed to register PROXY_CONNECTIONS_TOTAL metric");
 
     // Query metrics
     pub static ref QUERIES_TOTAL: CounterVec = register_counter_vec!(
@@ -26,7 +26,7 @@ lazy_static! {
         "Total number of queries processed",
         &["type", "status"]  // type: select/insert/update/delete, status: success/error
     )
-    .unwrap();
+    .expect("failed to register QUERIES_TOTAL metric");
 
     pub static ref QUERY_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
         "marlobu_query_duration_seconds",
@@ -34,21 +34,21 @@ lazy_static! {
         &["type"],
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
     )
-    .unwrap();
+    .expect("failed to register QUERY_DURATION_SECONDS metric");
 
     // Session metrics
     pub static ref SESSIONS_ACTIVE: Gauge = register_gauge!(
         "marlobu_sessions_active",
         "Number of active sessions"
     )
-    .unwrap();
+    .expect("failed to register SESSIONS_ACTIVE metric");
 
     pub static ref SESSIONS_TOTAL: CounterVec = register_counter_vec!(
         "marlobu_sessions_total",
         "Total number of sessions",
         &["status"]  // "created", "approved", "rejected", "expired"
     )
-    .unwrap();
+    .expect("failed to register SESSIONS_TOTAL metric");
 
     // Approval metrics
     pub static ref APPROVALS_TOTAL: CounterVec = register_counter_vec!(
@@ -56,14 +56,14 @@ lazy_static! {
         "Total number of approval attempts",
         &["result"]  // "success", "conflict", "fk_violation", "error"
     )
-    .unwrap();
+    .expect("failed to register APPROVALS_TOTAL metric");
 
     pub static ref APPROVAL_CHANGES_APPLIED: CounterVec = register_counter_vec!(
         "marlobu_approval_changes_applied",
         "Number of changes applied during approvals",
         &["type"]  // "insert", "update", "delete"
     )
-    .unwrap();
+    .expect("failed to register APPROVAL_CHANGES_APPLIED metric");
 
     // Rewriter metrics
     pub static ref REWRITE_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
@@ -72,7 +72,7 @@ lazy_static! {
         &["type"],
         vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
     )
-    .unwrap();
+    .expect("failed to register REWRITE_DURATION_SECONDS metric");
 
     // Infrastructure metrics
     pub static ref INFRA_CREATED_TOTAL: CounterVec = register_counter_vec!(
@@ -80,17 +80,24 @@ lazy_static! {
         "Total infrastructure objects created",
         &["type"]  // "view", "shadow_table", "deleted_table"
     )
-    .unwrap();
+    .expect("failed to register INFRA_CREATED_TOTAL metric");
 }
 
-/// Export metrics in Prometheus text format
+/// Export metrics in Prometheus text format.
+/// Returns an error message if encoding fails.
 pub fn export_metrics() -> String {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
+
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        return format!("# ERROR: failed to encode metrics: {}\n", e);
+    }
+
+    String::from_utf8(buffer).unwrap_or_else(|e| {
+        format!("# ERROR: metrics contained invalid UTF-8: {}\n", e)
+    })
 }
 
 #[cfg(test)]
