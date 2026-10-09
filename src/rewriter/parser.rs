@@ -960,4 +960,82 @@ mod tests {
         assert!(sql.contains("DO UPDATE"));
         assert!(sql.contains("WHERE"));
     }
+
+    #[test]
+    fn test_begin_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("BEGIN");
+        // BEGIN should pass through (classified as Other)
+        assert!(result.is_ok());
+        let (sql, query_type) = result.unwrap();
+        assert_eq!(query_type, QueryType::Other);
+        assert!(sql.to_uppercase().contains("BEGIN"));
+    }
+
+    #[test]
+    fn test_commit_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("COMMIT");
+        assert!(result.is_ok());
+        let (sql, query_type) = result.unwrap();
+        assert_eq!(query_type, QueryType::Other);
+        assert!(sql.to_uppercase().contains("COMMIT"));
+    }
+
+    #[test]
+    fn test_rollback_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("ROLLBACK");
+        assert!(result.is_ok());
+        let (sql, query_type) = result.unwrap();
+        assert_eq!(query_type, QueryType::Other);
+        assert!(sql.to_uppercase().contains("ROLLBACK"));
+    }
+
+    #[test]
+    fn test_savepoint() {
+        let r = rewriter();
+        let result = r.rewrite("SAVEPOINT my_savepoint");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("SAVEPOINT"));
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint() {
+        let r = rewriter();
+        let result = r.rewrite("ROLLBACK TO SAVEPOINT my_savepoint");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("ROLLBACK"));
+        assert!(sql.contains("my_savepoint"));
+    }
+
+    #[test]
+    fn test_release_savepoint() {
+        let r = rewriter();
+        let result = r.rewrite("RELEASE SAVEPOINT my_savepoint");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("RELEASE"));
+    }
+
+    #[test]
+    fn test_start_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("START TRANSACTION");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("START TRANSACTION"));
+    }
+
+    #[test]
+    fn test_begin_with_isolation_level() {
+        let r = rewriter();
+        let result = r.rewrite("BEGIN ISOLATION LEVEL SERIALIZABLE");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("BEGIN"));
+        assert!(sql.to_uppercase().contains("SERIALIZABLE"));
+    }
 }
