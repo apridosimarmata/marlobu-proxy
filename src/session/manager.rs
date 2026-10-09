@@ -185,8 +185,13 @@ impl SessionManager {
             other => SessionError::Store(other),
         })?;
 
-        // Check if expired
-        if session.is_expired() && session.status == SessionStatus::Active {
+        // Check if expired (applies to Active and PendingReview sessions)
+        if session.is_expired()
+            && matches!(
+                session.status,
+                SessionStatus::Active | SessionStatus::PendingReview
+            )
+        {
             // Mark as expired
             let mut expired = session.clone();
             expired.status = SessionStatus::Expired;
