@@ -1,0 +1,581 @@
+//! SQL query rewriter for sandbox isolation.
+//!
+//! Parses incoming SQL, classifies query type, and rewrites table references
+//! to route reads through views and writes to shadow tables.
+
+use sqlparser::ast::{
+    Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
+use thiserror::Error;
+
+use crate::rewriter::tables::{rewrite_table_name, should_skip_rewrite, RewriteContext};
+
+/// Errors that can occur during query rewriting.
+#[derive(Error, Debug)]
+pub enum RewriterError {
+    #[error("Failed to parse SQL: {0}")]
+    ParseError(String),
+
+    #[error("Blocked statement type: {0}")]
+    BlockedStatement(String),
+
+    #[error("Empty query")]
+    EmptyQuery,
+
+    #[error("Multiple statements not supported")]
+    MultipleStatements,
+}
+
+/// Classification of SQL query types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryType {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Ddl,
+    Other,
+}
+
+impl QueryType {
+    /// Returns true if this query type modifies data.
+    pub fn is_write(&self) -> bool {
+        matches!(self, QueryType::Insert | QueryType::Update | QueryType::Delete)
+    }
+}
+
+/// SQL query rewriter for sandbox isolation.
+pub struct Rewriter {
+    /// Target schema for rewritten queries
+    schema: String,
+    /// Dialect for parsing
+    dialect: PostgreSqlDialect,
+}
+
+impl Rewriter {
+    /// Creates a new rewriter targeting the given schema.
+    pub fn new(schema: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            dialect: PostgreSqlDialect {},
+        }
+    }
+
+    /// Parses and rewrites a SQL query for sandbox isolation.
+    ///
+    /// Returns the rewritten SQL and its query type.
+    pub fn rewrite(&self, sql: &str) -> Result<(String, QueryType), RewriterError> {
+        let mut statements = Parser::parse_sql(&self.dialect, sql)
+            .map_err(|e| RewriterError::ParseError(e.to_string()))?;
+
+        if statements.is_empty() {
+            return Err(RewriterError::EmptyQuery);
+        }
+
+        if statements.len() > 1 {
+            return Err(RewriterError::MultipleStatements);
+        }
+
+        let mut stmt = statements.remove(0);
+        let query_type = self.classify(&stmt);
+
+        // Block dangerous statements
+        self.check_blocked(&stmt)?;
+
+        // Rewrite table references
+        self.rewrite_statement(&mut stmt)?;
+
+        Ok((stmt.to_string(), query_type))
+    }
+
+    /// Classifies a statement by query type.
+    pub fn classify(&self, stmt: &Statement) -> QueryType {
+        match stmt {
+            Statement::Query(_) => QueryType::Select,
+            Statement::Insert { .. } => QueryType::Insert,
+            Statement::Update { .. } => QueryType::Update,
+            Statement::Delete { .. } => QueryType::Delete,
+            Statement::CreateTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::CreateView { .. }
+            | Statement::AlterTable { .. }
+            | Statement::Drop { .. }
+            | Statement::Truncate { .. } => QueryType::Ddl,
+            _ => QueryType::Other,
+        }
+    }
+
+    /// Checks if a statement should be blocked.
+    fn check_blocked(&self, stmt: &Statement) -> Result<(), RewriterError> {
+        match stmt {
+            // Block DDL
+            Statement::CreateTable { .. } => {
+                Err(RewriterError::BlockedStatement("CREATE TABLE".to_string()))
+            }
+            Statement::CreateIndex { .. } => {
+                Err(RewriterError::BlockedStatement("CREATE INDEX".to_string()))
+            }
+            Statement::CreateView { .. } => {
+                Err(RewriterError::BlockedStatement("CREATE VIEW".to_string()))
+            }
+            Statement::AlterTable { .. } => {
+                Err(RewriterError::BlockedStatement("ALTER TABLE".to_string()))
+            }
+            Statement::Drop { .. } => {
+                Err(RewriterError::BlockedStatement("DROP".to_string()))
+            }
+            Statement::Truncate { .. } => {
+                Err(RewriterError::BlockedStatement("TRUNCATE".to_string()))
+            }
+
+            // Block dangerous operations
+            Statement::Copy { .. } => {
+                Err(RewriterError::BlockedStatement("COPY".to_string()))
+            }
+            Statement::SetRole { .. } => {
+                Err(RewriterError::BlockedStatement("SET ROLE".to_string()))
+            }
+
+            // Allow everything else (will be rewritten)
+            _ => Ok(()),
+        }
+    }
+
+    /// Rewrites table references in a statement.
+    fn rewrite_statement(&self, stmt: &mut Statement) -> Result<(), RewriterError> {
+        match stmt {
+            Statement::Query(query) => {
+                self.rewrite_query(query, RewriteContext::Read);
+            }
+            Statement::Insert {
+                table_name,
+                source,
+                ..
+            } => {
+                // Target table goes to shadow
+                if !should_skip_rewrite(table_name) {
+                    *table_name = rewrite_table_name(
+                        table_name,
+                        &self.schema,
+                        RewriteContext::Write,
+                    );
+                }
+                // Source query (INSERT ... SELECT) goes to views
+                if let Some(ref mut src) = source {
+                    self.rewrite_query(src, RewriteContext::Read);
+                }
+            }
+            Statement::Update {
+                table,
+                from,
+                selection,
+                ..
+            } => {
+                // Target table goes to shadow
+                self.rewrite_table_with_joins(table, RewriteContext::Write);
+
+                // FROM clause goes to views (singular TableWithJoins in sqlparser 0.41)
+                if let Some(ref mut from_table) = from {
+                    self.rewrite_table_with_joins(from_table, RewriteContext::Read);
+                }
+
+                // Subqueries in WHERE go to views
+                if let Some(ref mut where_expr) = selection {
+                    self.rewrite_expr(where_expr, RewriteContext::Read);
+                }
+            }
+            Statement::Delete {
+                from,
+                using,
+                selection,
+                ..
+            } => {
+                // Target table(s) go to shadow
+                for table_with_joins in from.iter_mut() {
+                    self.rewrite_table_with_joins(table_with_joins, RewriteContext::Write);
+                }
+
+                // USING clause goes to views
+                if let Some(ref mut using_clause) = using {
+                    for table_with_joins in using_clause.iter_mut() {
+                        self.rewrite_table_with_joins(table_with_joins, RewriteContext::Read);
+                    }
+                }
+
+                // Subqueries in WHERE go to views
+                if let Some(ref mut where_expr) = selection {
+                    self.rewrite_expr(where_expr, RewriteContext::Read);
+                }
+            }
+            _ => {
+                // For other statement types, we don't rewrite
+                // (they should have been blocked or are safe as-is)
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrites all relations in a query to use views (for read context).
+    fn rewrite_query(&self, query: &mut Query, context: RewriteContext) {
+        // Handle CTEs
+        if let Some(ref mut with) = query.with {
+            for cte in with.cte_tables.iter_mut() {
+                self.rewrite_query(&mut cte.query, context);
+            }
+        }
+
+        // Handle main query body
+        self.rewrite_set_expr(&mut query.body, context);
+    }
+
+    /// Rewrites a SET expression (handles UNION, INTERSECT, etc.).
+    fn rewrite_set_expr(&self, set_expr: &mut SetExpr, context: RewriteContext) {
+        match set_expr {
+            SetExpr::Select(select) => {
+                self.rewrite_select(select, context);
+            }
+            SetExpr::Query(query) => {
+                self.rewrite_query(query, context);
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.rewrite_set_expr(left, context);
+                self.rewrite_set_expr(right, context);
+            }
+            SetExpr::Values(_) => {
+                // VALUES clause has no table references
+            }
+            SetExpr::Insert(stmt) => {
+                // Nested INSERT - stmt is Statement directly (not boxed)
+                if let Statement::Insert { ref mut table_name, .. } = stmt {
+                    if !should_skip_rewrite(table_name) {
+                        *table_name = rewrite_table_name(
+                            table_name,
+                            &self.schema,
+                            RewriteContext::Write,
+                        );
+                    }
+                }
+            }
+            SetExpr::Update(_) => {
+                // Nested UPDATE - handle gracefully
+            }
+            SetExpr::Table(table) => {
+                if let Some(ref name) = table.table_name {
+                    // table_name is Option<String> in SetExpr::Table
+                    // We can't easily rewrite this without more context
+                    // This is a rare edge case (TABLE tablename syntax)
+                    let _ = name; // Acknowledge but skip
+                }
+            }
+        }
+    }
+
+    /// Rewrites a SELECT statement.
+    fn rewrite_select(&self, select: &mut Select, context: RewriteContext) {
+        // Rewrite FROM clause
+        for table_with_joins in select.from.iter_mut() {
+            self.rewrite_table_with_joins(table_with_joins, context);
+        }
+
+        // Rewrite WHERE subqueries
+        if let Some(ref mut selection) = select.selection {
+            self.rewrite_expr(selection, context);
+        }
+
+        // Rewrite HAVING subqueries
+        if let Some(ref mut having) = select.having {
+            self.rewrite_expr(having, context);
+        }
+    }
+
+    /// Rewrites a table with its joins.
+    fn rewrite_table_with_joins(&self, table: &mut TableWithJoins, context: RewriteContext) {
+        self.rewrite_table_factor(&mut table.relation, context);
+
+        for join in table.joins.iter_mut() {
+            self.rewrite_table_factor(&mut join.relation, context);
+        }
+    }
+
+    /// Rewrites a table factor (table reference, subquery, etc.).
+    fn rewrite_table_factor(&self, factor: &mut TableFactor, context: RewriteContext) {
+        match factor {
+            TableFactor::Table { name, .. } => {
+                if !should_skip_rewrite(name) {
+                    *name = rewrite_table_name(name, &self.schema, context);
+                }
+            }
+            TableFactor::Derived { subquery, .. } => {
+                self.rewrite_query(subquery, context);
+            }
+            TableFactor::TableFunction { .. } => {
+                // Table functions don't need rewriting
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                self.rewrite_table_with_joins(table_with_joins, context);
+            }
+            _ => {
+                // Other table factors (UNNEST, etc.) - no table name to rewrite
+            }
+        }
+    }
+
+    /// Rewrites expressions, looking for subqueries.
+    fn rewrite_expr(&self, expr: &mut Expr, context: RewriteContext) {
+        match expr {
+            Expr::Subquery(query) => {
+                self.rewrite_query(query, context);
+            }
+            Expr::InSubquery { subquery, .. } => {
+                self.rewrite_query(subquery, context);
+            }
+            Expr::Exists { subquery, .. } => {
+                self.rewrite_query(subquery, context);
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.rewrite_expr(left, context);
+                self.rewrite_expr(right, context);
+            }
+            Expr::UnaryOp { expr: inner, .. } => {
+                self.rewrite_expr(inner, context);
+            }
+            Expr::Nested(inner) => {
+                self.rewrite_expr(inner, context);
+            }
+            Expr::Between { expr: inner, low, high, .. } => {
+                self.rewrite_expr(inner, context);
+                self.rewrite_expr(low, context);
+                self.rewrite_expr(high, context);
+            }
+            Expr::Case { operand, conditions, results, else_result, .. } => {
+                if let Some(op) = operand {
+                    self.rewrite_expr(op, context);
+                }
+                for cond in conditions {
+                    self.rewrite_expr(cond, context);
+                }
+                for result in results {
+                    self.rewrite_expr(result, context);
+                }
+                if let Some(else_expr) = else_result {
+                    self.rewrite_expr(else_expr, context);
+                }
+            }
+            Expr::InList { expr: inner, list, .. } => {
+                self.rewrite_expr(inner, context);
+                for item in list {
+                    self.rewrite_expr(item, context);
+                }
+            }
+            _ => {
+                // Other expressions don't contain table references we need to rewrite
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rewriter() -> Rewriter {
+        Rewriter::new("sandbox_123")
+    }
+
+    #[test]
+    fn test_simple_select() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite("SELECT * FROM users").unwrap();
+
+        assert_eq!(query_type, QueryType::Select);
+        assert!(sql.contains("sandbox_123.users_view"));
+    }
+
+    #[test]
+    fn test_select_with_join() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id"
+        ).unwrap();
+
+        assert!(sql.contains("sandbox_123.users_view"));
+        assert!(sql.contains("sandbox_123.orders_view"));
+    }
+
+    #[test]
+    fn test_select_with_subquery() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)"
+        ).unwrap();
+
+        assert!(sql.contains("sandbox_123.users_view"));
+        assert!(sql.contains("sandbox_123.orders_view"));
+    }
+
+    #[test]
+    fn test_select_with_cte() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active"
+        ).unwrap();
+
+        assert!(sql.contains("sandbox_123.users_view"));
+    }
+
+    #[test]
+    fn test_insert_simple() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "INSERT INTO users (name, email) VALUES ('John', 'john@example.com')"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Insert);
+        // Target should be shadow table, not view
+        assert!(sql.contains("sandbox_123.users"));
+        assert!(!sql.contains("users_view"));
+    }
+
+    #[test]
+    fn test_insert_select() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users_archive SELECT * FROM users WHERE created_at < '2024-01-01'"
+        ).unwrap();
+
+        // Target is shadow table
+        assert!(sql.contains("sandbox_123.users_archive"));
+        // Source is view
+        assert!(sql.contains("sandbox_123.users_view"));
+    }
+
+    #[test]
+    fn test_update_simple() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "UPDATE users SET name = 'Jane' WHERE id = 1"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Update);
+        assert!(sql.contains("sandbox_123.users"));
+        assert!(!sql.contains("users_view"));
+    }
+
+    #[test]
+    fn test_update_with_from() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "UPDATE users SET total = orders.sum FROM orders WHERE users.id = orders.user_id"
+        ).unwrap();
+
+        // Target is shadow table
+        assert!(sql.contains("UPDATE sandbox_123.users"));
+        // FROM clause is view
+        assert!(sql.contains("sandbox_123.orders_view"));
+    }
+
+    #[test]
+    fn test_delete_simple() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite("DELETE FROM users WHERE id = 1").unwrap();
+
+        assert_eq!(query_type, QueryType::Delete);
+        assert!(sql.contains("sandbox_123.users"));
+        assert!(!sql.contains("users_view"));
+    }
+
+    #[test]
+    fn test_delete_with_using() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "DELETE FROM users USING orders WHERE users.id = orders.user_id AND orders.total = 0"
+        ).unwrap();
+
+        // Target is shadow table
+        assert!(sql.contains("FROM sandbox_123.users"));
+        // USING is view
+        assert!(sql.contains("sandbox_123.orders_view"));
+    }
+
+    #[test]
+    fn test_block_ddl() {
+        let r = rewriter();
+
+        assert!(r.rewrite("CREATE TABLE foo (id INT)").is_err());
+        assert!(r.rewrite("DROP TABLE users").is_err());
+        assert!(r.rewrite("ALTER TABLE users ADD COLUMN foo INT").is_err());
+        assert!(r.rewrite("TRUNCATE users").is_err());
+    }
+
+    #[test]
+    fn test_block_dangerous() {
+        let r = rewriter();
+
+        assert!(r.rewrite("COPY users TO '/tmp/data.csv'").is_err());
+        assert!(r.rewrite("SET ROLE admin").is_err());
+    }
+
+    #[test]
+    fn test_skip_pg_catalog() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite("SELECT * FROM pg_class").unwrap();
+
+        // Should not rewrite system tables
+        assert!(sql.contains("pg_class"));
+        assert!(!sql.contains("sandbox_123"));
+    }
+
+    #[test]
+    fn test_query_type_classification() {
+        let r = rewriter();
+
+        let (_, qt) = r.rewrite("SELECT 1").unwrap();
+        assert_eq!(qt, QueryType::Select);
+
+        let (_, qt) = r.rewrite("INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(qt, QueryType::Insert);
+
+        let (_, qt) = r.rewrite("UPDATE t SET x = 1").unwrap();
+        assert_eq!(qt, QueryType::Update);
+
+        let (_, qt) = r.rewrite("DELETE FROM t").unwrap();
+        assert_eq!(qt, QueryType::Delete);
+    }
+
+    #[test]
+    fn test_is_write() {
+        assert!(!QueryType::Select.is_write());
+        assert!(QueryType::Insert.is_write());
+        assert!(QueryType::Update.is_write());
+        assert!(QueryType::Delete.is_write());
+        assert!(!QueryType::Ddl.is_write());
+        assert!(!QueryType::Other.is_write());
+    }
+
+    #[test]
+    fn test_complex_query() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(r#"
+            WITH recent_orders AS (
+                SELECT user_id, SUM(total) as total
+                FROM orders
+                WHERE created_at > '2024-01-01'
+                GROUP BY user_id
+            )
+            SELECT u.name, u.email, ro.total
+            FROM users u
+            LEFT JOIN recent_orders ro ON u.id = ro.user_id
+            WHERE u.active = true
+            AND EXISTS (SELECT 1 FROM payments p WHERE p.user_id = u.id)
+            ORDER BY ro.total DESC
+        "#).unwrap();
+
+        assert!(sql.contains("sandbox_123.orders_view"));
+        assert!(sql.contains("sandbox_123.users_view"));
+        assert!(sql.contains("sandbox_123.payments_view"));
+    }
+}

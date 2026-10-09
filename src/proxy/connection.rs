@@ -1,0 +1,485 @@
+//! Per-connection state machine for Postgres wire protocol proxy.
+
+use bytes::BytesMut;
+use std::collections::HashMap;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::proxy::protocol::{
+    self, encode_backend_message, encode_error, encode_parse, encode_query, encode_startup,
+    parse_backend_message, parse_frontend_message, BackendMessage, FrontendMessage, StartupMessage,
+};
+
+/// Connection state in the proxy lifecycle
+#[derive(Debug, Clone, PartialEq)]
+enum ConnectionState {
+    /// Waiting for initial message (SSL or Startup)
+    Initial,
+    /// Waiting for startup message after SSL rejection
+    AwaitingStartup,
+    /// Authenticating with backend
+    Authenticating,
+    /// Ready for queries
+    Ready,
+    /// Connection terminated
+    Terminated,
+}
+
+/// Per-connection handler
+pub struct Connection {
+    /// Client TCP stream
+    client: TcpStream,
+    /// Backend Postgres connection (established after startup)
+    backend: Option<TcpStream>,
+    /// Backend address to connect to
+    backend_addr: String,
+    /// Session ID extracted from marlobu_session parameter
+    session_id: Option<Uuid>,
+    /// Schema name for this session (will be resolved from session_id)
+    schema_name: Option<String>,
+    /// Read buffer for client messages
+    client_buffer: BytesMut,
+    /// Read buffer for backend messages
+    backend_buffer: BytesMut,
+    /// Current connection state
+    state: ConnectionState,
+    /// Original startup parameters from client
+    startup_params: HashMap<String, String>,
+}
+
+impl Connection {
+    /// Create a new connection handler
+    pub fn new(client: TcpStream, backend_addr: String) -> Self {
+        Self {
+            client,
+            backend: None,
+            backend_addr,
+            session_id: None,
+            schema_name: None,
+            client_buffer: BytesMut::with_capacity(8192),
+            backend_buffer: BytesMut::with_capacity(8192),
+            state: ConnectionState::Initial,
+            startup_params: HashMap::new(),
+        }
+    }
+
+    /// Run the connection handler
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let peer_addr = self.client.peer_addr().ok();
+        info!(?peer_addr, "New connection");
+
+        let result = self.handle_connection().await;
+
+        if let Err(ref e) = result {
+            // Don't log connection reset as error
+            if !is_connection_closed_error(e) {
+                error!(?peer_addr, error = %e, "Connection error");
+            }
+        }
+
+        info!(?peer_addr, "Connection closed");
+        Ok(())
+    }
+
+    async fn handle_connection(&mut self) -> anyhow::Result<()> {
+        // Phase 1: Handle startup (SSL negotiation + startup message)
+        self.handle_startup_phase().await?;
+
+        // Phase 2: Connect to backend and relay auth
+        self.connect_backend().await?;
+        self.relay_authentication().await?;
+
+        // Phase 3: Main query loop
+        self.state = ConnectionState::Ready;
+        self.main_loop().await
+    }
+
+    /// Handle the startup phase (SSL request and/or startup message)
+    async fn handle_startup_phase(&mut self) -> anyhow::Result<()> {
+        loop {
+            // Read data from client
+            let n = self.client.read_buf(&mut self.client_buffer).await?;
+            if n == 0 {
+                anyhow::bail!("Client disconnected during startup");
+            }
+
+            // Try to parse message
+            while let Some(msg) = parse_frontend_message(&mut self.client_buffer)? {
+                match msg {
+                    FrontendMessage::SslRequest => {
+                        debug!("Received SSL request, rejecting");
+                        // Reject SSL with 'N'
+                        self.client.write_all(b"N").await?;
+                        self.state = ConnectionState::AwaitingStartup;
+                    }
+                    FrontendMessage::Startup(startup) => {
+                        debug!(?startup.parameters, "Received startup message");
+                        self.process_startup(startup)?;
+                        return Ok(());
+                    }
+                    _ => {
+                        anyhow::bail!("Unexpected message during startup: {:?}", msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Process startup message and extract session info
+    fn process_startup(&mut self, startup: StartupMessage) -> anyhow::Result<()> {
+        self.startup_params = startup.parameters.clone();
+
+        // Extract marlobu_session - check direct parameter first
+        let session_str = startup.parameters.get("marlobu_session").cloned()
+            .or_else(|| {
+                // Check inside options parameter: "-c marlobu_session=uuid"
+                startup.parameters.get("options").and_then(|opts| {
+                    extract_option_value(opts, "marlobu_session")
+                })
+            });
+
+        if let Some(session_str) = session_str {
+            match Uuid::parse_str(&session_str) {
+                Ok(uuid) => {
+                    self.session_id = Some(uuid);
+                    self.schema_name = Some(format!("session_{}", uuid.to_string().replace('-', "_")));
+                    info!(session_id = %uuid, schema = ?self.schema_name, "Session identified");
+                }
+                Err(e) => {
+                    warn!(session = session_str, error = %e, "Invalid session UUID");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Connect to backend Postgres
+    async fn connect_backend(&mut self) -> anyhow::Result<()> {
+        debug!(addr = %self.backend_addr, "Connecting to backend");
+
+        let backend = TcpStream::connect(&self.backend_addr).await?;
+        self.backend = Some(backend);
+
+        // Send startup message to backend (without marlobu_session param)
+        let mut backend_params = self.startup_params.clone();
+        backend_params.remove("marlobu_session");
+
+        // Also strip marlobu_session from options parameter if present
+        if let Some(opts) = backend_params.get("options").cloned() {
+            let cleaned = strip_option_value(&opts, "marlobu_session");
+            if cleaned.trim().is_empty() {
+                backend_params.remove("options");
+            } else {
+                backend_params.insert("options".to_string(), cleaned);
+            }
+        }
+
+        let startup_msg = encode_startup(&backend_params);
+        self.backend
+            .as_mut()
+            .unwrap()
+            .write_all(&startup_msg)
+            .await?;
+
+        self.state = ConnectionState::Authenticating;
+        debug!("Backend connection established, starting auth");
+
+        Ok(())
+    }
+
+    /// Relay authentication messages between client and backend
+    async fn relay_authentication(&mut self) -> anyhow::Result<()> {
+        let backend = self.backend.as_mut().unwrap();
+
+        loop {
+            // Read from backend
+            let n = backend.read_buf(&mut self.backend_buffer).await?;
+            if n == 0 {
+                anyhow::bail!("Backend disconnected during authentication");
+            }
+
+            // Parse and relay messages
+            while let Some(msg) = parse_backend_message(&mut self.backend_buffer)? {
+                let encoded = encode_backend_message(&msg);
+
+                match &msg {
+                    BackendMessage::Authentication(payload) => {
+                        // Check if this is AuthenticationOk (type = 0)
+                        if payload.len() >= 4 {
+                            let auth_type = i32::from_be_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]);
+                            if auth_type == 0 {
+                                debug!("Authentication successful");
+                            }
+                        }
+                        self.client.write_all(&encoded).await?;
+                    }
+                    BackendMessage::ReadyForQuery(_) => {
+                        // Authentication complete, send to client
+                        self.client.write_all(&encoded).await?;
+                        debug!("Backend ready, authentication phase complete");
+                        return Ok(());
+                    }
+                    BackendMessage::ErrorResponse(_) => {
+                        // Forward error to client
+                        self.client.write_all(&encoded).await?;
+                        anyhow::bail!("Backend authentication failed");
+                    }
+                    _ => {
+                        // Relay other messages (ParameterStatus, BackendKeyData, etc.)
+                        self.client.write_all(&encoded).await?;
+                    }
+                }
+            }
+
+            // Check if backend needs password from client
+            // For now, we only support trust/md5/scram-sha-256 passthrough
+            if !self.client_buffer.is_empty() {
+                // There might be a password message waiting
+                if let Some(msg) = parse_frontend_message(&mut self.client_buffer)? {
+                    if let FrontendMessage::Password(payload) = msg {
+                        // Forward password to backend
+                        let mut pw_msg = BytesMut::new();
+                        pw_msg.extend_from_slice(&[b'p']);
+                        pw_msg.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+                        pw_msg.extend_from_slice(&payload);
+                        backend.write_all(&pw_msg).await?;
+                    }
+                }
+            }
+
+            // Read password from client if needed
+            tokio::select! {
+                result = self.client.read_buf(&mut self.client_buffer) => {
+                    let n = result?;
+                    if n == 0 {
+                        anyhow::bail!("Client disconnected during authentication");
+                    }
+
+                    // Check for password message
+                    while let Some(msg) = parse_frontend_message(&mut self.client_buffer)? {
+                        if let FrontendMessage::Password(payload) = msg {
+                            let mut pw_msg = BytesMut::new();
+                            pw_msg.extend_from_slice(&[b'p']);
+                            pw_msg.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+                            pw_msg.extend_from_slice(&payload);
+                            backend.write_all(&pw_msg).await?;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    // Small timeout to check backend again
+                }
+            }
+        }
+    }
+
+    /// Main query relay loop
+    async fn main_loop(&mut self) -> anyhow::Result<()> {
+        loop {
+            // Split borrows: we need separate access to client, backend, and buffers
+            let backend = self.backend.as_mut().unwrap();
+
+            tokio::select! {
+                // Read from client
+                result = self.client.read_buf(&mut self.client_buffer) => {
+                    let n = result?;
+                    if n == 0 {
+                        debug!("Client disconnected");
+                        return Ok(());
+                    }
+                }
+
+                // Read from backend
+                result = backend.read_buf(&mut self.backend_buffer) => {
+                    let n = result?;
+                    if n == 0 {
+                        debug!("Backend disconnected");
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Process any client messages (outside of select to avoid borrow issues)
+            while let Some(msg) = parse_frontend_message(&mut self.client_buffer)? {
+                match msg {
+                    FrontendMessage::Terminate => {
+                        debug!("Client sent Terminate");
+                        let backend = self.backend.as_mut().unwrap();
+                        backend.write_all(&[b'X', 0, 0, 0, 4]).await?;
+                        return Ok(());
+                    }
+                    FrontendMessage::Query(query) => {
+                        let rewritten = rewrite_query_for_schema(&query, self.schema_name.as_deref());
+                        debug!(original = %query, rewritten = %rewritten, "Query");
+                        let encoded = encode_query(&rewritten);
+                        let backend = self.backend.as_mut().unwrap();
+                        backend.write_all(&encoded).await?;
+                    }
+                    FrontendMessage::Parse { name, query, param_types } => {
+                        let rewritten = rewrite_query_for_schema(&query, self.schema_name.as_deref());
+                        debug!(original = %query, rewritten = %rewritten, "Parse");
+                        let encoded = encode_parse(&name, &rewritten, &param_types);
+                        let backend = self.backend.as_mut().unwrap();
+                        backend.write_all(&encoded).await?;
+                    }
+                    FrontendMessage::Bind(payload) => {
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'B', &payload).await?;
+                    }
+                    FrontendMessage::Describe(payload) => {
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'D', &payload).await?;
+                    }
+                    FrontendMessage::Execute(payload) => {
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'E', &payload).await?;
+                    }
+                    FrontendMessage::Sync => {
+                        let backend = self.backend.as_mut().unwrap();
+                        backend.write_all(&[b'S', 0, 0, 0, 4]).await?;
+                    }
+                    FrontendMessage::Other { tag, payload } => {
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), tag, &payload).await?;
+                    }
+                    _ => {
+                        warn!("Unexpected message in query phase: {:?}", msg);
+                    }
+                }
+            }
+
+            // Relay backend messages to client
+            while let Some(msg) = parse_backend_message(&mut self.backend_buffer)? {
+                let encoded = encode_backend_message(&msg);
+                self.client.write_all(&encoded).await?;
+            }
+        }
+    }
+
+    /// Send error to client and optionally close connection
+    #[allow(dead_code)]
+    async fn send_error(&mut self, message: &str) -> anyhow::Result<()> {
+        let error_msg = encode_error("ERROR", "08000", message);
+        self.client.write_all(&error_msg).await?;
+
+        // Send ReadyForQuery if we're in ready state
+        if self.state == ConnectionState::Ready {
+            let ready = protocol::encode_ready_for_query(b'I');
+            self.client.write_all(&ready).await?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Rewrite SQL query for session isolation (free function to avoid borrow issues)
+/// TODO: Integrate with rewriter module
+fn rewrite_query_for_schema(query: &str, schema_name: Option<&str>) -> String {
+    if let Some(schema) = schema_name {
+        // Don't rewrite SET commands or empty queries
+        let trimmed = query.trim().to_uppercase();
+        if trimmed.starts_with("SET") || trimmed.is_empty() {
+            return query.to_string();
+        }
+
+        // For v1: simple prefix with search_path
+        // TODO: Use proper SQL rewriter for table qualification
+        format!("SET search_path TO {}, public; {}", schema, query)
+    } else {
+        query.to_string()
+    }
+}
+
+/// Forward a raw message to backend (free function to avoid borrow issues)
+async fn forward_raw_to_backend(backend: &mut TcpStream, tag: u8, payload: &[u8]) -> anyhow::Result<()> {
+    use bytes::BufMut;
+    let mut msg = BytesMut::new();
+    msg.put_u8(tag);
+    msg.put_i32(4 + payload.len() as i32);
+    msg.put_slice(payload);
+    backend.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Check if error is a normal connection close
+fn is_connection_closed_error(e: &anyhow::Error) -> bool {
+    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    } else {
+        e.to_string().contains("disconnected")
+    }
+}
+
+/// Extract a value from Postgres options string (e.g., "-c key=value -c other=x")
+fn extract_option_value(options: &str, key: &str) -> Option<String> {
+    let pattern = format!("-c {}=", key);
+    if let Some(pos) = options.find(&pattern) {
+        let start = pos + pattern.len();
+        let rest = &options[start..];
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    } else {
+        None
+    }
+}
+
+/// Strip a key=value pair from Postgres options string
+fn strip_option_value(options: &str, key: &str) -> String {
+    let pattern = format!("-c {}=", key);
+    if let Some(pos) = options.find(&pattern) {
+        let before = &options[..pos];
+        let rest = &options[pos + pattern.len()..];
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        let after = &rest[end..];
+        format!("{}{}", before.trim(), after).trim().to_string()
+    } else {
+        options.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_query_with_schema() {
+        let result = rewrite_query_for_schema("SELECT * FROM users", Some("session_abc123"));
+        assert!(result.contains("SET search_path TO session_abc123"));
+        assert!(result.contains("SELECT * FROM users"));
+    }
+
+    #[test]
+    fn test_rewrite_query_without_schema() {
+        let result = rewrite_query_for_schema("SELECT * FROM users", None);
+        assert_eq!(result, "SELECT * FROM users");
+    }
+
+    #[test]
+    fn test_rewrite_skips_set_commands() {
+        let result = rewrite_query_for_schema("SET timezone TO 'UTC'", Some("session_abc123"));
+        assert_eq!(result, "SET timezone TO 'UTC'");
+    }
+
+    #[test]
+    fn test_extract_option_value() {
+        let opts = "-c marlobu_session=abc-123 -c other=xyz";
+        assert_eq!(extract_option_value(opts, "marlobu_session"), Some("abc-123".to_string()));
+        assert_eq!(extract_option_value(opts, "other"), Some("xyz".to_string()));
+        assert_eq!(extract_option_value(opts, "missing"), None);
+    }
+
+    #[test]
+    fn test_strip_option_value() {
+        let opts = "-c marlobu_session=abc-123 -c other=xyz";
+        assert_eq!(strip_option_value(opts, "marlobu_session"), "-c other=xyz");
+
+        let opts2 = "-c marlobu_session=abc-123";
+        assert_eq!(strip_option_value(opts2, "marlobu_session"), "");
+    }
+}

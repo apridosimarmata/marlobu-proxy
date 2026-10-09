@@ -1,0 +1,267 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use deadpool_postgres::Pool;
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tokio_postgres::Row;
+use uuid::Uuid;
+
+use super::manager::{Session, SessionStatus, TableState};
+
+#[derive(Error, Debug)]
+pub enum StoreError {
+    #[error("Session not found: {0}")]
+    NotFound(Uuid),
+
+    #[error("Database error: {0}")]
+    Database(#[from] tokio_postgres::Error),
+
+    #[error("Pool error: {0}")]
+    Pool(#[from] deadpool_postgres::PoolError),
+
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
+
+pub type StoreResult<T> = Result<T, StoreError>;
+
+/// In-memory cache + Postgres persistence for sessions
+pub struct SessionStore {
+    pool: Pool,
+    cache: Arc<RwLock<HashMap<Uuid, Session>>>,
+}
+
+impl SessionStore {
+    pub fn new(pool: Pool) -> Self {
+        Self {
+            pool,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Initialize the sessions metadata table
+    pub async fn init(&self) -> StoreResult<()> {
+        let client = self.pool.get().await?;
+
+        client
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS _marlobu_sessions (
+                    id UUID PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    schema_name TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    tables JSONB NOT NULL DEFAULT '{}'
+                )
+                "#,
+                &[],
+            )
+            .await?;
+
+        client
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_project ON _marlobu_sessions(project_id)",
+                &[],
+            )
+            .await?;
+
+        client
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON _marlobu_sessions(expires_at)",
+                &[],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Insert a new session into both cache and database
+    pub async fn insert(&self, session: Session) -> StoreResult<()> {
+        let client = self.pool.get().await?;
+
+        let tables_json = serde_json::to_value(&session.tables)?;
+        let status_str = session.status.as_str();
+
+        client
+            .execute(
+                r#"
+                INSERT INTO _marlobu_sessions (id, project_id, schema_name, status, created_at, expires_at, tables)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "#,
+                &[
+                    &session.id,
+                    &session.project_id,
+                    &session.schema_name,
+                    &status_str,
+                    &session.created_at,
+                    &session.expires_at,
+                    &tables_json,
+                ],
+            )
+            .await?;
+
+        // Update cache
+        let mut cache = self.cache.write().await;
+        cache.insert(session.id, session);
+
+        Ok(())
+    }
+
+    /// Get session from cache or load from database
+    pub async fn get(&self, id: Uuid) -> StoreResult<Session> {
+        // Check cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some(session) = cache.get(&id) {
+                return Ok(session.clone());
+            }
+        }
+
+        // Load from database
+        let session = self.load_from_db(id).await?;
+
+        // Update cache
+        {
+            let mut cache = self.cache.write().await;
+            cache.insert(id, session.clone());
+        }
+
+        Ok(session)
+    }
+
+    /// Load session from database
+    async fn load_from_db(&self, id: Uuid) -> StoreResult<Session> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_opt(
+                r#"
+                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                FROM _marlobu_sessions
+                WHERE id = $1
+                "#,
+                &[&id],
+            )
+            .await?
+            .ok_or(StoreError::NotFound(id))?;
+
+        Self::row_to_session(row)
+    }
+
+    /// Update session in both cache and database
+    pub async fn update(&self, session: &Session) -> StoreResult<()> {
+        let client = self.pool.get().await?;
+
+        let tables_json = serde_json::to_value(&session.tables)?;
+        let status_str = session.status.as_str();
+
+        client
+            .execute(
+                r#"
+                UPDATE _marlobu_sessions
+                SET status = $2, tables = $3, expires_at = $4
+                WHERE id = $1
+                "#,
+                &[&session.id, &status_str, &tables_json, &session.expires_at],
+            )
+            .await?;
+
+        // Update cache
+        let mut cache = self.cache.write().await;
+        cache.insert(session.id, session.clone());
+
+        Ok(())
+    }
+
+    /// Delete session from both cache and database
+    pub async fn delete(&self, id: Uuid) -> StoreResult<()> {
+        let client = self.pool.get().await?;
+
+        client
+            .execute("DELETE FROM _marlobu_sessions WHERE id = $1", &[&id])
+            .await?;
+
+        // Remove from cache
+        let mut cache = self.cache.write().await;
+        cache.remove(&id);
+
+        Ok(())
+    }
+
+    /// List all sessions for a project
+    pub async fn list_by_project(&self, project_id: &str) -> StoreResult<Vec<Session>> {
+        let client = self.pool.get().await?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                FROM _marlobu_sessions
+                WHERE project_id = $1
+                ORDER BY created_at DESC
+                "#,
+                &[&project_id],
+            )
+            .await?;
+
+        rows.into_iter().map(Self::row_to_session).collect()
+    }
+
+    /// List expired sessions
+    pub async fn list_expired(&self) -> StoreResult<Vec<Session>> {
+        let client = self.pool.get().await?;
+        let now = Utc::now();
+
+        let rows = client
+            .query(
+                r#"
+                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                FROM _marlobu_sessions
+                WHERE expires_at < $1 AND status = 'active'
+                "#,
+                &[&now],
+            )
+            .await?;
+
+        rows.into_iter().map(Self::row_to_session).collect()
+    }
+
+    /// Invalidate cache entry
+    pub async fn invalidate_cache(&self, id: Uuid) {
+        let mut cache = self.cache.write().await;
+        cache.remove(&id);
+    }
+
+    /// Clear entire cache
+    pub async fn clear_cache(&self) {
+        let mut cache = self.cache.write().await;
+        cache.clear();
+    }
+
+    fn row_to_session(row: Row) -> StoreResult<Session> {
+        let id: Uuid = row.get("id");
+        let project_id: String = row.get("project_id");
+        let schema_name: String = row.get("schema_name");
+        let status_str: String = row.get("status");
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let expires_at: DateTime<Utc> = row.get("expires_at");
+        let tables_json: serde_json::Value = row.get("tables");
+
+        let status = SessionStatus::from_str(&status_str);
+        let tables: HashMap<String, TableState> = serde_json::from_value(tables_json)?;
+
+        Ok(Session {
+            id,
+            project_id,
+            schema_name,
+            status,
+            created_at,
+            expires_at,
+            tables,
+        })
+    }
+}
