@@ -128,18 +128,38 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Check if a shadow table already exists in the session schema
+    #[instrument(skip(self), level = "debug")]
+    pub async fn shadow_table_exists(
+        &self,
+        session_schema: &str,
+        table_name: &str,
+    ) -> SchemaResult<bool> {
+        let client = self.pool.get().await?;
+        let shadow_name = format!("_shadow_{}", table_name);
+        self.table_exists(&client, session_schema, &shadow_name).await
+    }
+
     /// Create shadow table for copy-on-write semantics
     /// Uses advisory locks to prevent race conditions
+    ///
+    /// The shadow table copies the structure from the source table and adds:
+    /// - `_mlb_op`: VARCHAR tracking the operation type (INSERT/UPDATE)
+    /// - `_mlb_ts`: TIMESTAMPTZ tracking when the operation occurred
+    ///
+    /// The shadow table is named `_shadow_{table_name}` in the session schema.
+    #[instrument(skip(self), level = "debug")]
     pub async fn create_shadow_table(
         &self,
-        schema_name: &str,
+        session_schema: &str,
         source_schema: &str,
         table_name: &str,
     ) -> SchemaResult<String> {
         let client = self.pool.get().await?;
+        let shadow_name = format!("_shadow_{}", table_name);
 
-        // Generate a deterministic lock key from schema + table
-        let lock_key = Self::advisory_lock_key(schema_name, table_name);
+        // Generate a deterministic lock key from schema + shadow table name
+        let lock_key = Self::advisory_lock_key(session_schema, &shadow_name);
 
         // Try to acquire advisory lock (will block if another session is creating same table)
         let lock_acquired: bool = client
@@ -155,13 +175,13 @@ impl SchemaManager {
         }
 
         // Check if table already exists (another session may have created it)
-        let shadow_table = format!("{}.{}", quote_ident(schema_name), quote_ident(table_name));
-        let exists = self.table_exists(&client, schema_name, table_name).await?;
+        let shadow_table = format!("{}.{}", quote_ident(session_schema), quote_ident(&shadow_name));
+        let exists = self.table_exists(&client, session_schema, &shadow_name).await?;
 
         if exists {
             debug!(
-                schema = schema_name,
-                table = table_name,
+                session_schema = session_schema,
+                shadow_table = shadow_name,
                 "Shadow table already exists"
             );
             // Release lock
@@ -171,19 +191,25 @@ impl SchemaManager {
             return Ok(shadow_table);
         }
 
-        // Create shadow table with same structure as source
+        // Create shadow table with same structure as source, plus tracking columns
         let source_table = format!("{}.{}", quote_ident(source_schema), quote_ident(table_name));
         let create_sql = format!(
-            "CREATE TABLE {} (LIKE {} INCLUDING ALL)",
+            r#"CREATE TABLE {} (
+                LIKE {} INCLUDING ALL,
+                _mlb_op VARCHAR(10) NOT NULL,
+                _mlb_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )"#,
             shadow_table, source_table
         );
 
         match client.execute(&create_sql, &[]).await {
             Ok(_) => {
                 info!(
-                    schema = schema_name,
-                    table = table_name,
-                    "Created shadow table"
+                    session_schema = session_schema,
+                    source_schema = source_schema,
+                    source_table = table_name,
+                    shadow_table = shadow_name,
+                    "Created shadow table with tracking columns (_mlb_op, _mlb_ts)"
                 );
             }
             Err(e) => {
@@ -683,5 +709,35 @@ mod tests {
         let num_columns = 1;
         let placeholders: Vec<String> = (1..=num_columns).map(|i| format!("${}", i)).collect();
         assert_eq!(placeholders.join(", "), "$1");
+    }
+
+    #[test]
+    fn test_shadow_table_naming() {
+        // Verify the shadow table naming convention
+        let table_name = "users";
+        let shadow_name = format!("_shadow_{}", table_name);
+        assert_eq!(shadow_name, "_shadow_users");
+    }
+
+    #[test]
+    fn test_shadow_table_name_with_underscores() {
+        // Shadow table name preserves original table name
+        let table_name = "user_accounts";
+        let shadow_name = format!("_shadow_{}", table_name);
+        assert_eq!(shadow_name, "_shadow_user_accounts");
+    }
+
+    #[test]
+    fn test_shadow_table_full_qualified_name() {
+        // Test fully qualified shadow table name generation
+        let session_schema = "mlb_session_abc123";
+        let table_name = "orders";
+        let shadow_name = format!("_shadow_{}", table_name);
+        let full_name = format!(
+            "{}.{}",
+            quote_ident(session_schema),
+            quote_ident(&shadow_name)
+        );
+        assert_eq!(full_name, "\"mlb_session_abc123\".\"_shadow_orders\"");
     }
 }
