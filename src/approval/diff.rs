@@ -18,6 +18,9 @@ pub enum DiffError {
 
     #[error("Invalid identifier: {0}")]
     InvalidIdentifier(String),
+
+    #[error("Composite primary key not supported for table: {0}")]
+    CompositePrimaryKeyNotSupported(String),
 }
 
 /// Changes for a single table
@@ -322,7 +325,13 @@ async fn get_table_columns(
         )
         .await?;
 
-    Ok(rows.iter().map(|r| r.get("column_name")).collect())
+    // Validate each column name from database metadata for defense-in-depth
+    let columns: Vec<String> = rows.iter().map(|r| r.get("column_name")).collect();
+    for col in &columns {
+        validate_identifier(col)?;
+    }
+
+    Ok(columns)
 }
 
 async fn get_primary_key_column(
@@ -330,8 +339,8 @@ async fn get_primary_key_column(
     schema_name: &str,
     table_name: &str,
 ) -> Result<String, DiffError> {
-    let row = client
-        .query_opt(
+    let rows = client
+        .query(
             r#"
             SELECT a.attname as column_name
             FROM pg_index i
@@ -341,17 +350,23 @@ async fn get_primary_key_column(
             WHERE i.indisprimary
               AND n.nspname = $1
               AND c.relname = $2
-            LIMIT 1
+            ORDER BY a.attnum
             "#,
             &[&schema_name, &table_name],
         )
         .await?;
 
-    match row {
-        Some(r) => Ok(r.get("column_name")),
-        None => Err(DiffError::PrimaryKeyNotFound(format!(
+    match rows.len() {
+        0 => Err(DiffError::PrimaryKeyNotFound(format!(
             "{}.{}",
             schema_name, table_name
+        ))),
+        1 => Ok(rows[0].get("column_name")),
+        _ => Err(DiffError::CompositePrimaryKeyNotSupported(format!(
+            "{}.{} has {} primary key columns",
+            schema_name,
+            table_name,
+            rows.len()
         ))),
     }
 }
