@@ -36,23 +36,26 @@ pub struct CachedAnalysis {
 impl QueryCache {
     /// Create a new query cache with the given capacity.
     pub fn new(capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
+        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).expect("1000 is non-zero"));
         Self {
             cache: Mutex::new(LruCache::new(cap)),
         }
     }
 
     /// Get a cached query analysis, if present.
+    /// Returns None if the cache is poisoned (another thread panicked while holding the lock).
     pub fn get(&self, schema: &str, sql: &str) -> Option<CachedAnalysis> {
         let key = CacheKey {
             schema: schema.to_string(),
             sql: sql.to_string(),
         };
-        let mut cache = self.cache.lock().unwrap();
+        // Recover from poisoned mutex - cache data is still usable
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.get(&key).map(|c| c.analysis.clone())
     }
 
     /// Insert a query analysis into the cache.
+    /// Silently skips insertion if the cache is poisoned.
     pub fn insert(&self, schema: &str, sql: &str, analysis: &QueryAnalysis) {
         let key = CacheKey {
             schema: schema.to_string(),
@@ -71,13 +74,15 @@ impl QueryCache {
                     .collect(),
             },
         };
-        let mut cache = self.cache.lock().unwrap();
+        // Recover from poisoned mutex - cache data is still usable
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.put(key, cached);
     }
 
     /// Get cache statistics.
     pub fn stats(&self) -> CacheStats {
-        let cache = self.cache.lock().unwrap();
+        // Recover from poisoned mutex - cache data is still usable
+        let cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         CacheStats {
             len: cache.len(),
             cap: cache.cap().get(),
