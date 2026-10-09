@@ -107,7 +107,7 @@ pub async fn check_conflicts(
                 schema = quote_ident(schema_name),
                 table = quote_ident(&table.table_name),
                 pk = quote_ident(&table.primary_key),
-                pk_type = quote_ident(&table.primary_key_type),
+                pk_type = table.primary_key_type,
             ), &[&table.table_name]).await?;
 
             for row in collision_rows {
