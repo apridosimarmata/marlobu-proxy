@@ -647,10 +647,20 @@ fn validate_pg_data_type(data_type: &str) -> Result<(), SchemaError> {
         return Err(SchemaError::InvalidDataType(data_type.to_string()));
     }
 
+    // Check for SQL injection patterns (symbols that shouldn't appear in type names)
+    let forbidden_patterns = [";", "--", "/*", "*/"];
+    for pattern in &forbidden_patterns {
+        if trimmed.contains(pattern) {
+            return Err(SchemaError::InvalidDataType(data_type.to_string()));
+        }
+    }
+
+    // Check for SQL keywords as whole words (word boundaries), not substrings.
+    // This allows valid types like tsvector, tsquery which contain "select" as substring.
     let lower = trimmed.to_lowercase();
-    let forbidden = [";", "--", "/*", "*/", "drop", "delete", "insert", "update", "select", "exec", "execute"];
-    for pattern in &forbidden {
-        if lower.contains(pattern) {
+    let forbidden_keywords = ["drop", "delete", "insert", "update", "select", "exec", "execute", "alter", "create", "grant", "revoke"];
+    for keyword in &forbidden_keywords {
+        if is_standalone_word(&lower, keyword) {
             return Err(SchemaError::InvalidDataType(data_type.to_string()));
         }
     }
@@ -672,6 +682,32 @@ fn validate_pg_data_type(data_type: &str) -> Result<(), SchemaError> {
     }
 
     Ok(())
+}
+
+/// Check if a keyword appears as a standalone word in the input string.
+/// A standalone word is surrounded by non-alphanumeric characters or string boundaries.
+fn is_standalone_word(input: &str, keyword: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = input[start..].find(keyword) {
+        let abs_pos = start + pos;
+        let end_pos = abs_pos + keyword.len();
+
+        // Check character before the match (if any)
+        let before_ok = abs_pos == 0 || !input[..abs_pos].chars().last().unwrap_or(' ').is_alphanumeric();
+
+        // Check character after the match (if any)
+        let after_ok = end_pos >= input.len() || !input[end_pos..].chars().next().unwrap_or(' ').is_alphanumeric();
+
+        if before_ok && after_ok {
+            return true;
+        }
+
+        start = abs_pos + 1;
+        if start >= input.len() {
+            break;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -743,6 +779,10 @@ mod tests {
         assert!(validate_pg_data_type("timestamp with time zone").is_ok());
         assert!(validate_pg_data_type("integer[]").is_ok());
         assert!(validate_pg_data_type("pg_catalog.int4").is_ok());
+        // Types containing SQL keywords as substrings should be valid
+        assert!(validate_pg_data_type("tsvector").is_ok());
+        assert!(validate_pg_data_type("tsquery").is_ok());
+        assert!(validate_pg_data_type("pg_catalog.tsvector").is_ok());
     }
 
     #[test]
@@ -752,12 +792,30 @@ mod tests {
         assert!(validate_pg_data_type("integer/*comment*/").is_err());
         assert!(validate_pg_data_type("text' OR '1'='1").is_err());
         assert!(validate_pg_data_type("").is_err());
+        // Standalone SQL keywords should be rejected
         assert!(validate_pg_data_type("select * from users").is_err());
+        assert!(validate_pg_data_type("integer drop").is_err());
+        assert!(validate_pg_data_type("delete from t").is_err());
     }
 
     #[test]
     fn test_validate_pg_data_type_too_long() {
         let long_type = "a".repeat(200);
         assert!(validate_pg_data_type(&long_type).is_err());
+    }
+
+    #[test]
+    fn test_is_standalone_word() {
+        // Keyword as standalone word
+        assert!(is_standalone_word("select foo", "select"));
+        assert!(is_standalone_word("foo select bar", "select"));
+        assert!(is_standalone_word("foo select", "select"));
+        assert!(is_standalone_word("select", "select"));
+
+        // Keyword as substring (not standalone)
+        assert!(!is_standalone_word("tsvector", "select"));
+        assert!(!is_standalone_word("tsquery", "select"));
+        assert!(!is_standalone_word("preselected", "select"));
+        assert!(!is_standalone_word("selectivity", "select"));
     }
 }
