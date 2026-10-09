@@ -57,6 +57,9 @@ pub fn generate_union_view_sql(
     pk_columns: &[String],
     columns: &[String],
 ) -> String {
+    assert!(!pk_columns.is_empty(), "Primary key columns cannot be empty");
+    assert!(!columns.is_empty(), "Columns cannot be empty");
+
     let quoted_session_schema = quote_ident(session_schema);
     let quoted_source_schema = quote_ident(source_schema);
     let quoted_table = quote_ident(table_name);
@@ -92,17 +95,25 @@ WHERE {pk_not_in_shadow}
 
 /// Generates the NOT IN clause for primary key filtering.
 /// Handles both single and composite primary keys.
+/// Adds IS NOT NULL filters to handle NULL values correctly in NOT IN subqueries.
 fn generate_pk_not_in_clause(pk_columns: &[String], schema: &str, table: &str) -> String {
+    assert!(!pk_columns.is_empty(), "Primary key columns cannot be empty");
+
     if pk_columns.len() == 1 {
         // Simple case: single column PK
         let pk = quote_ident(&pk_columns[0]);
-        format!("{pk} NOT IN (SELECT {pk} FROM {schema}.{table})")
+        format!("{pk} NOT IN (SELECT {pk} FROM {schema}.{table} WHERE {pk} IS NOT NULL)")
     } else {
         // Composite PK: use row comparison
         let quoted_pks: Vec<String> = pk_columns.iter().map(|c| quote_ident(c)).collect();
         let pk_tuple = quoted_pks.join(", ");
+        let not_null_conditions: Vec<String> = quoted_pks
+            .iter()
+            .map(|pk| format!("{pk} IS NOT NULL"))
+            .collect();
+        let not_null_clause = not_null_conditions.join(" AND ");
         format!(
-            "({pk_tuple}) NOT IN (SELECT {pk_tuple} FROM {schema}.{table})"
+            "({pk_tuple}) NOT IN (SELECT {pk_tuple} FROM {schema}.{table} WHERE {not_null_clause})"
         )
     }
 }
@@ -196,6 +207,13 @@ pub async fn create_union_view(
     table_name: &str,
     pk_columns: &[String],
 ) -> ViewResult<()> {
+    if pk_columns.is_empty() {
+        return Err(ViewError::NoColumnsFound(
+            "primary key".to_string(),
+            table_name.to_string(),
+        ));
+    }
+
     // Fetch columns from the source schema (production table)
     let columns = fetch_table_columns(pool, source_schema, table_name).await?;
 
@@ -494,9 +512,9 @@ mod tests {
         // Check column list is quoted
         assert!(sql.contains(r#""id", "name", "email""#));
 
-        // Check NOT IN clauses for shadow and deleted tables
-        assert!(sql.contains(r#""id" NOT IN (SELECT "id" FROM "session_abc"."_shadow_users")"#));
-        assert!(sql.contains(r#""id" NOT IN (SELECT "id" FROM "session_abc"."_deleted_users")"#));
+        // Check NOT IN clauses for shadow and deleted tables (with IS NOT NULL)
+        assert!(sql.contains(r#""id" NOT IN (SELECT "id" FROM "session_abc"."_shadow_users" WHERE "id" IS NOT NULL)"#));
+        assert!(sql.contains(r#""id" NOT IN (SELECT "id" FROM "session_abc"."_deleted_users" WHERE "id" IS NOT NULL)"#));
     }
 
     #[test]
@@ -517,12 +535,12 @@ mod tests {
             &columns,
         );
 
-        // Check composite PK handling with row comparison
+        // Check composite PK handling with row comparison (with IS NOT NULL)
         assert!(sql.contains(
-            r#"("order_id", "product_id") NOT IN (SELECT "order_id", "product_id" FROM "session_xyz"."_shadow_order_items")"#
+            r#"("order_id", "product_id") NOT IN (SELECT "order_id", "product_id" FROM "session_xyz"."_shadow_order_items" WHERE "order_id" IS NOT NULL AND "product_id" IS NOT NULL)"#
         ));
         assert!(sql.contains(
-            r#"("order_id", "product_id") NOT IN (SELECT "order_id", "product_id" FROM "session_xyz"."_deleted_order_items")"#
+            r#"("order_id", "product_id") NOT IN (SELECT "order_id", "product_id" FROM "session_xyz"."_deleted_order_items" WHERE "order_id" IS NOT NULL AND "product_id" IS NOT NULL)"#
         ));
     }
 
@@ -566,7 +584,7 @@ mod tests {
 
         assert_eq!(
             clause,
-            r#""id" NOT IN (SELECT "id" FROM "schema"."table")"#
+            r#""id" NOT IN (SELECT "id" FROM "schema"."table" WHERE "id" IS NOT NULL)"#
         );
     }
 
@@ -577,7 +595,7 @@ mod tests {
 
         assert_eq!(
             clause,
-            r#"("a", "b", "c") NOT IN (SELECT "a", "b", "c" FROM "s"."t")"#
+            r#"("a", "b", "c") NOT IN (SELECT "a", "b", "c" FROM "s"."t" WHERE "a" IS NOT NULL AND "b" IS NOT NULL AND "c" IS NOT NULL)"#
         );
     }
 }
