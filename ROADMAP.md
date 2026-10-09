@@ -28,17 +28,19 @@
 
 ---
 
-## Phase 2: Conflict Detection & Approval (v0.3)
+## Phase 2: Conflict Detection & Approval (v0.3) ✅
 *Safe merge back to production*
 
-- [ ] **Conflict detection** — Compare fork-time hash vs current production hash
-- [ ] **Conflict types** — Modified, deleted, constraint violation
-- [ ] **Approval API** — `POST /sessions/:id/approve` with atomic apply
-- [ ] **Reject API** — `POST /sessions/:id/reject` drops schema cleanly
-- [ ] **Mutation log** — Track all changes for review UI
-- [ ] **Diff generation** — Human-readable before/after for approval UI
+- [x] **Conflict detection** — Compare fork-time hash vs current production hash (PR #8)
+- [x] **Conflict types** — Modified, deleted, constraint violation (PR #8)
+- [x] **Approval API** — `POST /sessions/:id/approve` with atomic apply (PR #8)
+- [x] **Reject API** — `POST /sessions/:id/reject` drops schema cleanly (PR #7)
+- [x] **Mutation log** — Track all changes for review UI (PR #9)
+- [x] **Diff generation** — Human-readable before/after for approval UI (PR #10)
 
 **Exit criteria:** Full create → modify → approve/reject cycle works.
+
+**Status:** Phase 2 complete. Approval applies shadow changes to production atomically with conflict detection. Reject drops session schema cleanly. Mutation log and diff generation provide visibility into staged changes.
 
 ---
 
