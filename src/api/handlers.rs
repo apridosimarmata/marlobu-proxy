@@ -13,6 +13,22 @@ use uuid::Uuid;
 use crate::approval::conflict::{check_row_hash_conflicts, ConflictType};
 use crate::approval::diff::{generate_session_diff, SessionDiff};
 use crate::session::{Session, SessionManager, SessionStatus};
+// ============================================================================
+// SQL Identifier Validation
+// ============================================================================
+
+fn validate_identifier(ident: &str) -> Result<(), String> {
+    if ident.is_empty() { return Err("identifier cannot be empty".to_string()); }
+    if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!("identifier contains invalid characters: {}", ident));
+    }
+    Ok(())
+}
+
+fn safe_quote_ident(ident: &str) -> Result<String, String> {
+    validate_identifier(ident)?;
+    Ok(format!("\"{}\"", ident.replace('"', "\"\""))
+}
 
 // ============================================================================
 // Application State
@@ -360,18 +376,22 @@ async fn apply_shadow_to_production(
         let pk = &table_state.primary_key;
         let schema = &session.schema_name;
 
+        let quoted_table = safe_quote_ident(table_name).map_err(|e| format!("Invalid table: {}", e))?;
+        let quoted_schema = safe_quote_ident(schema).map_err(|e| format!("Invalid schema: {}", e))?;
+        let quoted_pk = safe_quote_ident(pk).map_err(|e| format!("Invalid pk: {}", e))?;
+
         // Apply INSERTs (rows in shadow not in prod)
         let insert_sql = format!(
             r#"
-            INSERT INTO public."{table}"
-            SELECT s.* FROM "{schema}"."{table}" s
+            INSERT INTO public.{table}
+            SELECT s.* FROM {schema}.{table} s
             WHERE NOT EXISTS (
-                SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+                SELECT 1 FROM public.{table} p WHERE p.{pk} = s.{pk}
             )
             "#,
-            schema = schema,
-            table = table_name,
-            pk = pk,
+            schema = quoted_schema,
+            table = quoted_table,
+            pk = quoted_pk,
         );
         let inserted = client.execute(&insert_sql, &[]).await?;
         total_applied += inserted as usize;
@@ -398,20 +418,23 @@ async fn apply_shadow_to_production(
         if !columns.is_empty() {
             let set_clause = columns
                 .iter()
-                .map(|col| format!(r#""{col}" = s."{col}""#))
-                .collect::<Vec<_>>()
+                .map(|col| {
+                    let q = safe_quote_ident(col)?;
+                    Ok(format!("{} = s.{}", q, q))
+                })
+                .collect::<Result<Vec<_>, String>>()?
                 .join(", ");
 
             let update_sql = format!(
                 r#"
-                UPDATE public."{table}" p
+                UPDATE public.{table} p
                 SET {set_clause}
-                FROM "{schema}"."{table}" s
-                WHERE p."{pk}" = s."{pk}"
+                FROM {schema}.{table} s
+                WHERE p.{pk} = s.{pk}
                 "#,
-                schema = schema,
-                table = table_name,
-                pk = pk,
+                schema = quoted_schema,
+                table = quoted_table,
+                pk = quoted_pk,
                 set_clause = set_clause,
             );
             let updated = client.execute(&update_sql, &[]).await?;
@@ -421,14 +444,14 @@ async fn apply_shadow_to_production(
         // Apply DELETEs (check _mlb_deletes table if it exists)
         let delete_sql = format!(
             r#"
-            DELETE FROM public."{table}"
-            WHERE "{pk}"::text IN (
+            DELETE FROM public.{table}
+            WHERE {pk}::text IN (
                 SELECT pk_value FROM "{schema}"._mlb_deletes WHERE table_name = $1
             )
             "#,
-            schema = schema,
-            table = table_name,
-            pk = pk,
+            schema = quoted_schema,
+            table = quoted_table,
+            pk = quoted_pk,
         );
         // Ignore error if _mlb_deletes doesn't exist
         if let Ok(deleted) = client.execute(&delete_sql, &[&table_name]).await {
