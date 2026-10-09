@@ -399,11 +399,117 @@ impl Connection {
         Ok(())
     }
 
+    /// Check if query is a session switch command (SET marlobu.session)
+    /// Returns Some((new_session_id, rest_of_query)) if it's a session switch, None otherwise
+    fn parse_session_switch(&self, query: &str) -> Option<(Option<Uuid>, Option<String>)> {
+        let trimmed = query.trim();
+        let upper = trimmed.to_uppercase();
+
+        // Handle: SET marlobu.session TO 'uuid' or SET marlobu.session = 'uuid'
+        if upper.starts_with("SET MARLOBU.SESSION") || upper.starts_with("SET MARLOBU_SESSION") {
+            // Find the value - it's quoted
+            let after_set = &trimmed[19..]; // Skip "SET marlobu.session" or "SET marlobu_session"
+
+            // Find the quoted value
+            if let Some(quote_start) = after_set.find('\'').or_else(|| after_set.find('"')) {
+                let quote_char = after_set.chars().nth(quote_start).unwrap();
+                let value_start = quote_start + 1;
+                if let Some(quote_end) = after_set[value_start..].find(quote_char) {
+                    let value = &after_set[value_start..value_start + quote_end];
+
+                    // Check for remaining statements after the SET
+                    let rest_start = value_start + quote_end + 1;
+                    let rest = after_set[rest_start..].trim();
+                    let remaining = if rest.starts_with(';') {
+                        let after_semi = rest[1..].trim();
+                        if after_semi.is_empty() {
+                            None
+                        } else {
+                            Some(after_semi.to_string())
+                        }
+                    } else {
+                        None
+                    };
+
+                    if value.is_empty() {
+                        return Some((None, remaining)); // Clear session
+                    }
+                    if let Ok(uuid) = Uuid::parse_str(value) {
+                        return Some((Some(uuid), remaining));
+                    }
+                    return Some((None, remaining)); // Invalid UUID = clear session
+                }
+            }
+            return Some((None, None)); // Malformed = clear session
+        }
+
+        // Handle: RESET marlobu.session
+        if upper.starts_with("RESET MARLOBU.SESSION") || upper.starts_with("RESET MARLOBU_SESSION") {
+            let rest = trimmed[21..].trim(); // Skip "RESET marlobu.session"
+            let remaining = if rest.starts_with(';') {
+                let after_semi = rest[1..].trim();
+                if after_semi.is_empty() { None } else { Some(after_semi.to_string()) }
+            } else {
+                None
+            };
+            return Some((None, remaining));
+        }
+
+        // Handle: DISCARD ALL (PgBouncer sends this to reset connection state)
+        if upper.starts_with("DISCARD ALL") {
+            return Some((None, None));
+        }
+
+        None
+    }
+
+    /// Switch to a new session (or clear session)
+    fn switch_session(&mut self, new_session: Option<Uuid>) {
+        match new_session {
+            Some(uuid) => {
+                let schema = format!("session_{}", uuid.to_string().replace('-', "_"));
+                info!(session_id = %uuid, schema = %schema, "Switching to session");
+                self.session_id = Some(uuid);
+                self.schema_name = Some(schema.clone());
+                self.rewriter = Some(Rewriter::new(&schema));
+                self.ensured_tables.clear(); // Reset infrastructure cache
+            }
+            None => {
+                info!("Clearing session (passthrough mode)");
+                self.session_id = None;
+                self.schema_name = None;
+                self.rewriter = None;
+                self.ensured_tables.clear();
+            }
+        }
+    }
+
     /// Rewrite a query using the session's rewriter, ensuring infrastructure exists
     async fn rewrite_query(&mut self, query: &str) -> String {
-        // Skip empty queries and SET commands
         let trimmed = query.trim();
-        if trimmed.is_empty() || trimmed.to_uppercase().starts_with("SET") {
+
+        // Skip empty queries
+        if trimmed.is_empty() {
+            return query.to_string();
+        }
+
+        // Check for session switch commands (PgBouncer compatibility)
+        if let Some((new_session, remaining)) = self.parse_session_switch(trimmed) {
+            self.switch_session(new_session);
+
+            // If there are remaining statements after SET, process them
+            if let Some(rest) = remaining {
+                // Recursively rewrite the rest
+                let rewritten_rest = Box::pin(self.rewrite_query(&rest)).await;
+                return rewritten_rest;
+            }
+
+            // Return a harmless SET that backend will accept
+            return "SET client_encoding TO 'UTF8'".to_string();
+        }
+
+        // Skip other SET commands
+        if trimmed.to_uppercase().starts_with("SET") {
             return query.to_string();
         }
 
