@@ -19,7 +19,10 @@ use super::handlers::{
 
 /// Build the API router with all routes
 pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
-    let state = AppState { session_manager, source_schema: "public".to_string() };
+    let state = AppState {
+        session_manager,
+        source_schema: "public".to_string(),
+    };
 
     Router::new()
         // Session CRUD

@@ -350,7 +350,11 @@ impl SessionManager {
     }
 
     /// Extend session TTL
-    pub async fn extend(&self, session_id: Uuid, additional_seconds: i64) -> SessionResult<Session> {
+    pub async fn extend(
+        &self,
+        session_id: Uuid,
+        additional_seconds: i64,
+    ) -> SessionResult<Session> {
         let mut session = self.get_active(session_id).await?;
 
         session.expires_at = session.expires_at + Duration::seconds(additional_seconds);

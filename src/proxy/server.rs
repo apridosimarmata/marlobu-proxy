@@ -1,8 +1,8 @@
 //! TCP server for Postgres wire protocol proxy.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use deadpool_postgres::Pool;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info, warn};

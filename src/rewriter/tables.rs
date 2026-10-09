@@ -5,7 +5,7 @@
 //! - Write operations (INSERT, UPDATE, DELETE targets) → `{schema}._view_{table}`
 //!   (INSTEAD OF triggers on views handle copy-on-write to shadow tables)
 
-use sqlparser::ast::{ObjectName, Ident};
+use sqlparser::ast::{Ident, ObjectName};
 
 /// Context for table rewriting - determines view vs shadow table routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,11 +24,7 @@ pub enum RewriteContext {
 /// - `users` with Read context → `schema_123._view_users`
 /// - `users` with Write context → `schema_123._view_users` (triggers handle shadow)
 /// - `public.orders` with Read context → `schema_123._view_orders`
-pub fn rewrite_table_name(
-    table: &ObjectName,
-    schema: &str,
-    context: RewriteContext,
-) -> ObjectName {
+pub fn rewrite_table_name(table: &ObjectName, schema: &str, context: RewriteContext) -> ObjectName {
     let table_name = extract_table_name(table);
 
     // DirectWrite goes to shadow table (for COPY which bypasses triggers)
@@ -38,16 +34,15 @@ pub fn rewrite_table_name(
         _ => format!("_view_{}", table_name),
     };
 
-    ObjectName(vec![
-        Ident::new(schema),
-        Ident::new(rewritten_name),
-    ])
+    ObjectName(vec![Ident::new(schema), Ident::new(rewritten_name)])
 }
 
 /// Extracts the base table name, stripping any existing schema prefix.
 fn extract_table_name(table: &ObjectName) -> &str {
     // ObjectName is a Vec<Ident>, last element is the table name
-    table.0.last()
+    table
+        .0
+        .last()
         .map(|ident| ident.value.as_str())
         .unwrap_or("unknown")
 }
@@ -63,17 +58,12 @@ pub fn should_skip_rewrite(table: &ObjectName) -> bool {
     }
 
     // Skip common system tables
-    matches!(name.as_str(),
-        "dual" | "sqlite_master" | "sqlite_sequence"
-    )
+    matches!(name.as_str(), "dual" | "sqlite_master" | "sqlite_sequence")
 }
 
 /// Creates a fully qualified table reference.
 pub fn qualify_table(schema: &str, table: &str) -> ObjectName {
-    ObjectName(vec![
-        Ident::new(schema),
-        Ident::new(table),
-    ])
+    ObjectName(vec![Ident::new(schema), Ident::new(table)])
 }
 
 /// Creates a view name for a table.

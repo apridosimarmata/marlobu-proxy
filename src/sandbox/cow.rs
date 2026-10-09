@@ -23,7 +23,8 @@ pub async fn copy_rows_to_shadow(
     hash_columns: &[String],
 ) -> Result<u64, CowError> {
     // 1. Copy rows to shadow (if not already there)
-    let copy_sql = format!(r#"
+    let copy_sql = format!(
+        r#"
         INSERT INTO {schema}.{table}
         SELECT * FROM public.{table}
         WHERE {where_clause}
@@ -44,7 +45,8 @@ pub async fn copy_rows_to_shadow(
         format!("md5(concat_ws('|', {}))", hash_columns.join(", "))
     };
 
-    let capture_sql = format!(r#"
+    let capture_sql = format!(
+        r#"
         INSERT INTO {schema}._expected_state (table_name, row_id, state_hash)
         SELECT
             '{table}',
@@ -74,15 +76,17 @@ pub async fn create_shadow_table(
     table_name: &str,
 ) -> Result<(), CowError> {
     // Check if shadow already exists
-    let exists = client.query_one(
-        r#"
+    let exists = client
+        .query_one(
+            r#"
         SELECT EXISTS(
             SELECT 1 FROM information_schema.tables
             WHERE table_schema = $1 AND table_name = $2
         )
         "#,
-        &[&schema_name, &table_name],
-    ).await?;
+            &[&schema_name, &table_name],
+        )
+        .await?;
 
     let shadow_exists: bool = exists.get(0);
     if shadow_exists {
@@ -90,16 +94,17 @@ pub async fn create_shadow_table(
     }
 
     // Create shadow table with same structure
-    client.execute(&format!(
-        "CREATE TABLE {}.{} (LIKE public.{} INCLUDING ALL)",
-        schema_name, table_name, table_name
-    ), &[]).await?;
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE {}.{} (LIKE public.{} INCLUDING ALL)",
+                schema_name, table_name, table_name
+            ),
+            &[],
+        )
+        .await?;
 
-    tracing::debug!(
-        "Created shadow table {}.{}",
-        schema_name,
-        table_name
-    );
+    tracing::debug!("Created shadow table {}.{}", schema_name, table_name);
 
     Ok(())
 }
@@ -113,10 +118,9 @@ pub async fn ensure_shadow_table(
     // Use advisory lock to prevent concurrent creation
     let lock_key = hash_lock_key(schema_name, table_name);
 
-    client.execute(
-        "SELECT pg_advisory_xact_lock($1)",
-        &[&lock_key],
-    ).await?;
+    client
+        .execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
+        .await?;
 
     // Now safe to create (lock will release when transaction ends)
     create_shadow_table(client, schema_name, table_name).await

@@ -150,7 +150,8 @@ pub async fn get_session_mutations(
             .unwrap_or(&deleted_table_name);
 
         // Get primary key column(s) for deleted table
-        let pk_columns = get_pk_columns_for_deleted_table(&client, schema_name, &deleted_table_name).await?;
+        let pk_columns =
+            get_pk_columns_for_deleted_table(&client, schema_name, &deleted_table_name).await?;
 
         if !pk_columns.is_empty() {
             // Build row_id as concatenation of PK columns for composite keys
@@ -286,7 +287,10 @@ mod tests {
     #[test]
     fn test_safe_quote_ident() {
         assert_eq!(safe_quote_ident("simple").unwrap(), "\"simple\"");
-        assert_eq!(safe_quote_ident("with_underscore").unwrap(), "\"with_underscore\"");
+        assert_eq!(
+            safe_quote_ident("with_underscore").unwrap(),
+            "\"with_underscore\""
+        );
         assert!(safe_quote_ident("with\"quote").is_err());
         assert!(safe_quote_ident("mal;icious").is_err());
     }

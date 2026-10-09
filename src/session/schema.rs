@@ -151,7 +151,8 @@ impl SchemaManager {
     ) -> SchemaResult<bool> {
         let client = self.pool.get().await?;
         let shadow_name = format!("_shadow_{}", table_name);
-        self.table_exists(&client, session_schema, &shadow_name).await
+        self.table_exists(&client, session_schema, &shadow_name)
+            .await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -177,8 +178,15 @@ impl SchemaManager {
                 .await?;
         }
 
-        let shadow_table = format!("{}.{}", quote_ident(session_schema), quote_ident(&shadow_name));
-        let exists = match self.table_exists(&client, session_schema, &shadow_name).await {
+        let shadow_table = format!(
+            "{}.{}",
+            quote_ident(session_schema),
+            quote_ident(&shadow_name)
+        );
+        let exists = match self
+            .table_exists(&client, session_schema, &shadow_name)
+            .await
+        {
             Ok(e) => e,
             Err(e) => {
                 // Release lock before returning error to prevent deadlocks
@@ -357,7 +365,11 @@ impl SchemaManager {
             .map(|r| r.get::<_, String>("column_name"))
             .collect();
 
-        let col_list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let col_list = columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let create_view = format!(
             r#"
@@ -385,8 +397,13 @@ impl SchemaManager {
 
         client.execute(&create_view, &[]).await?;
 
-        let new_col_list = columns.iter().map(|c| format!("NEW.{}", quote_ident(c))).collect::<Vec<_>>().join(", ");
-        let update_set = columns.iter()
+        let new_col_list = columns
+            .iter()
+            .map(|c| format!("NEW.{}", quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_set = columns
+            .iter()
             .filter(|c| c.as_str() != primary_key)
             .map(|c| format!("{} = NEW.{}", quote_ident(c), quote_ident(c)))
             .collect::<Vec<_>>()
@@ -694,7 +711,10 @@ impl SchemaManager {
             }
         };
 
-        let pk_columns = match self.get_primary_key_columns(source_schema, table_name).await {
+        let pk_columns = match self
+            .get_primary_key_columns(source_schema, table_name)
+            .await
+        {
             Ok(cols) => cols,
             Err(e) => {
                 // Release lock before returning error to prevent deadlocks
@@ -875,8 +895,10 @@ impl SchemaManager {
             placeholders.join(", ")
         );
 
-        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            values.iter().map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = values
+            .iter()
+            .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         client.execute(&insert_sql, &params).await?;
 
@@ -898,7 +920,13 @@ fn quote_ident(ident: &str) -> String {
 fn safe_ident(ident: &str) -> String {
     ident
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -921,7 +949,10 @@ fn validate_pg_data_type(data_type: &str) -> Result<(), SchemaError> {
     // Check for SQL keywords as whole words (word boundaries), not substrings.
     // This allows valid types like tsvector, tsquery which contain "select" as substring.
     let lower = trimmed.to_lowercase();
-    let forbidden_keywords = ["drop", "delete", "insert", "update", "select", "exec", "execute", "alter", "create", "grant", "revoke", "union", "from", "join", "where", "having", "group", "order"];
+    let forbidden_keywords = [
+        "drop", "delete", "insert", "update", "select", "exec", "execute", "alter", "create",
+        "grant", "revoke", "union", "from", "join", "where", "having", "group", "order",
+    ];
     for keyword in &forbidden_keywords {
         if is_standalone_word(&lower, keyword) {
             return Err(SchemaError::InvalidDataType(data_type.to_string()));
@@ -956,10 +987,20 @@ fn is_standalone_word(input: &str, keyword: &str) -> bool {
         let end_pos = abs_pos + keyword.len();
 
         // Check character before the match (if any)
-        let before_ok = abs_pos == 0 || !input[..abs_pos].chars().last().unwrap_or(' ').is_alphanumeric();
+        let before_ok = abs_pos == 0
+            || !input[..abs_pos]
+                .chars()
+                .last()
+                .unwrap_or(' ')
+                .is_alphanumeric();
 
         // Check character after the match (if any)
-        let after_ok = end_pos >= input.len() || !input[end_pos..].chars().next().unwrap_or(' ').is_alphanumeric();
+        let after_ok = end_pos >= input.len()
+            || !input[end_pos..]
+                .chars()
+                .next()
+                .unwrap_or(' ')
+                .is_alphanumeric();
 
         if before_ok && after_ok {
             return true;

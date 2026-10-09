@@ -166,18 +166,14 @@ pub async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let session = state
-        .session_manager
-        .get(id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
+    let session = state.session_manager.get(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
 
     Ok(Json(SessionResponse {
         session_id: session.id.to_string(),
@@ -242,9 +238,12 @@ pub async fn approve_session(
         Err(e) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::to_value(ErrorResponse {
-                    error: e.to_string(),
-                }).unwrap()),
+                Json(
+                    serde_json::to_value(ErrorResponse {
+                        error: e.to_string(),
+                    })
+                    .unwrap(),
+                ),
             );
         }
     };
@@ -252,12 +251,15 @@ pub async fn approve_session(
     if session.status != SessionStatus::PendingReview {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(ErrorResponse {
-                error: format!(
-                    "Session must be in pending_review status to approve (current: {})",
-                    session.status.as_str()
-                ),
-            }).unwrap()),
+            Json(
+                serde_json::to_value(ErrorResponse {
+                    error: format!(
+                        "Session must be in pending_review status to approve (current: {})",
+                        session.status.as_str()
+                    ),
+                })
+                .unwrap(),
+            ),
         );
     }
 
@@ -268,9 +270,12 @@ pub async fn approve_session(
             error!(error = %e, "Failed to get database connection");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::to_value(ErrorResponse {
-                    error: "Database connection error".to_string(),
-                }).unwrap()),
+                Json(
+                    serde_json::to_value(ErrorResponse {
+                        error: "Database connection error".to_string(),
+                    })
+                    .unwrap(),
+                ),
             );
         }
     };
@@ -282,9 +287,12 @@ pub async fn approve_session(
             error!(error = %e, session_id = %id, "Failed to check conflicts");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::to_value(ErrorResponse {
-                    error: format!("Conflict check failed: {}", e),
-                }).unwrap()),
+                Json(
+                    serde_json::to_value(ErrorResponse {
+                        error: format!("Conflict check failed: {}", e),
+                    })
+                    .unwrap(),
+                ),
             );
         }
     };
@@ -314,23 +322,30 @@ pub async fn approve_session(
 
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::to_value(ConflictResponse {
-                status: "conflicts".to_string(),
-                conflicts: conflict_details,
-            }).unwrap()),
+            Json(
+                serde_json::to_value(ConflictResponse {
+                    status: "conflicts".to_string(),
+                    conflicts: conflict_details,
+                })
+                .unwrap(),
+            ),
         );
     }
 
     // 5. Check for FK constraint violations
-    let fk_violations = match validate_fk_constraints(&client, &session.schema_name, "public").await {
+    let fk_violations = match validate_fk_constraints(&client, &session.schema_name, "public").await
+    {
         Ok(v) => v,
         Err(e) => {
             error!(error = %e, session_id = %id, "Failed to check FK constraints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::to_value(ErrorResponse {
-                    error: format!("FK constraint check failed: {}", e),
-                }).unwrap()),
+                Json(
+                    serde_json::to_value(ErrorResponse {
+                        error: format!("FK constraint check failed: {}", e),
+                    })
+                    .unwrap(),
+                ),
             );
         }
     };
@@ -360,10 +375,13 @@ pub async fn approve_session(
 
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::to_value(FkViolationResponse {
-                status: "fk_violations".to_string(),
-                violations: violation_details,
-            }).unwrap()),
+            Json(
+                serde_json::to_value(FkViolationResponse {
+                    status: "fk_violations".to_string(),
+                    violations: violation_details,
+                })
+                .unwrap(),
+            ),
         );
     }
 
@@ -374,21 +392,33 @@ pub async fn approve_session(
             error!(error = %e, session_id = %id, "Failed to apply changes");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::to_value(ErrorResponse {
-                    error: format!("Failed to apply changes: {}", e),
-                }).unwrap()),
+                Json(
+                    serde_json::to_value(ErrorResponse {
+                        error: format!("Failed to apply changes: {}", e),
+                    })
+                    .unwrap(),
+                ),
             );
         }
     };
 
     // 6. Update session status to Approved
-    if let Err(e) = state.session_manager.update_status(id, SessionStatus::Approved).await {
+    if let Err(e) = state
+        .session_manager
+        .update_status(id, SessionStatus::Approved)
+        .await
+    {
         error!(error = %e, session_id = %id, "Failed to update session status");
         // Changes already applied, log error but continue
     }
 
     // 7. Drop the session schema after successful apply
-    if let Err(e) = state.session_manager.schema_manager().drop_session_schema(&session.schema_name).await {
+    if let Err(e) = state
+        .session_manager
+        .schema_manager()
+        .drop_session_schema(&session.schema_name)
+        .await
+    {
         error!(error = %e, session_id = %id, "Failed to drop session schema");
         // Not critical, schema can be cleaned up later
     }
@@ -401,10 +431,13 @@ pub async fn approve_session(
 
     (
         StatusCode::OK,
-        Json(serde_json::to_value(ApproveResponse {
-            status: "approved".to_string(),
-            applied,
-        }).unwrap()),
+        Json(
+            serde_json::to_value(ApproveResponse {
+                status: "approved".to_string(),
+                applied,
+            })
+            .unwrap(),
+        ),
     )
 }
 
@@ -441,7 +474,9 @@ async fn apply_shadow_to_production(
 
     for shadow_table_name in shadow_tables {
         // Extract base table name: "_shadow_users" -> "users"
-        let table_name = shadow_table_name.strip_prefix("_shadow_").unwrap_or(&shadow_table_name);
+        let table_name = shadow_table_name
+            .strip_prefix("_shadow_")
+            .unwrap_or(&shadow_table_name);
 
         // Get primary key from production table
         let pk_row = client
@@ -507,10 +542,8 @@ async fn apply_shadow_to_production(
         // Apply INSERTs (rows in shadow not yet in prod)
         if is_pk_sequence {
             // Sequence PK: exclude PK column so Postgres assigns fresh IDs
-            let insert_columns: Vec<&str> = all_columns.iter()
-                .filter(|c| *c != &pk)
-                .copied()
-                .collect();
+            let insert_columns: Vec<&str> =
+                all_columns.iter().filter(|c| *c != &pk).copied().collect();
             let insert_col_list = insert_columns
                 .iter()
                 .map(|c| format!(r#""{}""#, c))
@@ -560,10 +593,7 @@ async fn apply_shadow_to_production(
         }
 
         // Apply UPDATEs (rows in shadow that exist in prod)
-        let non_pk_columns: Vec<&str> = all_columns.iter()
-            .filter(|c| *c != &pk)
-            .copied()
-            .collect();
+        let non_pk_columns: Vec<&str> = all_columns.iter().filter(|c| *c != &pk).copied().collect();
 
         if !non_pk_columns.is_empty() {
             let set_clause = non_pk_columns
@@ -635,18 +665,14 @@ pub async fn reject_session(
         })?;
 
     // Then destroy the session (drop schema and remove from store)
-    state
-        .session_manager
-        .destroy(id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to cleanup session: {}", e),
-                }),
-            )
-        })?;
+    state.session_manager.destroy(id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to cleanup session: {}", e),
+            }),
+        )
+    })?;
 
     Ok(Json(MessageResponse {
         message: format!("Session {} rejected and discarded", id),
@@ -669,17 +695,18 @@ pub async fn get_mutations(
     })?;
 
     // Query mutations from shadow and deleted tables
-    let mutation_records = get_session_mutations(state.session_manager.pool(), &session.schema_name)
-        .await
-        .map_err(|e| {
-            error!(session_id = %id, error = %e, "Failed to get mutations");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
+    let mutation_records =
+        get_session_mutations(state.session_manager.pool(), &session.schema_name)
+            .await
+            .map_err(|e| {
+                error!(session_id = %id, error = %e, "Failed to get mutations");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+            })?;
 
     // Convert to response format
     let mutations: Vec<Mutation> = mutation_records
@@ -706,18 +733,14 @@ pub async fn get_session_diff(
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionDiff>, (StatusCode, Json<ErrorResponse>)> {
     // Get session
-    let session = state
-        .session_manager
-        .get(id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
+    let session = state.session_manager.get(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
 
     // Generate diff using pool
     let tables = generate_session_diff(
@@ -748,4 +771,3 @@ pub async fn health_check() -> Json<HealthResponse> {
         timestamp: Utc::now(),
     })
 }
-

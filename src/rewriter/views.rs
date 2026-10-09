@@ -137,8 +137,10 @@ pub fn generate_union_view_sql(
     let column_list = quoted_columns.join(", ");
 
     // Build the NOT IN conditions for composite primary keys
-    let pk_not_in_shadow = generate_pk_not_in_clause(pk_columns, &quoted_session_schema, &shadow_table);
-    let pk_not_in_deleted = generate_pk_not_in_clause(pk_columns, &quoted_session_schema, &deleted_table);
+    let pk_not_in_shadow =
+        generate_pk_not_in_clause(pk_columns, &quoted_session_schema, &shadow_table);
+    let pk_not_in_deleted =
+        generate_pk_not_in_clause(pk_columns, &quoted_session_schema, &deleted_table);
 
     Ok(format!(
         r#"CREATE OR REPLACE VIEW {session_schema}.{table_name} AS
@@ -412,11 +414,7 @@ pub struct TableInfo {
 ///     WHERE del.id = base.id
 /// );
 /// ```
-pub fn generate_view_sql(
-    schema: &str,
-    base_schema: &str,
-    table: &TableInfo,
-) -> String {
+pub fn generate_view_sql(schema: &str, base_schema: &str, table: &TableInfo) -> String {
     let view_name = view_name_for_table(&table.name);
     let columns = table.columns.join(", ");
     let pk_conditions = generate_pk_conditions(&table.primary_key, "shadow", "base");
@@ -448,11 +446,7 @@ AND NOT EXISTS (
 /// Generates a CREATE TABLE statement for the shadow table.
 ///
 /// Shadow tables mirror the base table structure exactly.
-pub fn generate_shadow_table_sql(
-    schema: &str,
-    base_schema: &str,
-    table_name: &str,
-) -> String {
+pub fn generate_shadow_table_sql(schema: &str, base_schema: &str, table_name: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {schema}.{table_name} (LIKE {base_schema}.{table_name} INCLUDING ALL)",
         schema = schema,
@@ -464,11 +458,10 @@ pub fn generate_shadow_table_sql(
 /// Generates a CREATE TABLE statement for the deletion tracking table.
 ///
 /// Stores primary keys of rows "deleted" in this sandbox.
-pub fn generate_deleted_table_sql(
-    schema: &str,
-    table: &TableInfo,
-) -> String {
-    let pk_columns: Vec<String> = table.primary_key.iter()
+pub fn generate_deleted_table_sql(schema: &str, table: &TableInfo) -> String {
+    let pk_columns: Vec<String> = table
+        .primary_key
+        .iter()
         .map(|col| format!("{} TEXT NOT NULL", col))
         .collect();
 
@@ -486,18 +479,23 @@ pub fn generate_deleted_table_sql(
 /// Generates DROP statements for sandbox cleanup.
 pub fn generate_cleanup_sql(schema: &str, table_name: &str) -> Vec<String> {
     vec![
-        format!("DROP VIEW IF EXISTS {}._view_{} CASCADE", schema, table_name),
-        format!("DROP TABLE IF EXISTS {}._shadow_{} CASCADE", schema, table_name),
-        format!("DROP TABLE IF EXISTS {}._deleted_{} CASCADE", schema, table_name),
+        format!(
+            "DROP VIEW IF EXISTS {}._view_{} CASCADE",
+            schema, table_name
+        ),
+        format!(
+            "DROP TABLE IF EXISTS {}._shadow_{} CASCADE",
+            schema, table_name
+        ),
+        format!(
+            "DROP TABLE IF EXISTS {}._deleted_{} CASCADE",
+            schema, table_name
+        ),
     ]
 }
 
 /// Generates the full setup SQL for a table in a sandbox.
-pub fn generate_table_setup_sql(
-    schema: &str,
-    base_schema: &str,
-    table: &TableInfo,
-) -> Vec<String> {
+pub fn generate_table_setup_sql(schema: &str, base_schema: &str, table: &TableInfo) -> Vec<String> {
     vec![
         generate_shadow_table_sql(schema, base_schema, &table.name),
         generate_deleted_table_sql(schema, table),
@@ -507,7 +505,8 @@ pub fn generate_table_setup_sql(
 
 /// Helper to generate PK equality conditions between two table aliases.
 fn generate_pk_conditions(pk_columns: &[String], left_alias: &str, right_alias: &str) -> String {
-    pk_columns.iter()
+    pk_columns
+        .iter()
         .map(|col| format!("{}.{} = {}.{}", left_alias, col, right_alias, col))
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -559,12 +558,18 @@ mod tests {
     fn test_composite_primary_key() {
         let table = TableInfo {
             name: "order_items".to_string(),
-            columns: vec!["order_id".to_string(), "item_id".to_string(), "quantity".to_string()],
+            columns: vec![
+                "order_id".to_string(),
+                "item_id".to_string(),
+                "quantity".to_string(),
+            ],
             primary_key: vec!["order_id".to_string(), "item_id".to_string()],
         };
 
         let view_sql = generate_view_sql("sandbox_123", "public", &table);
-        assert!(view_sql.contains("shadow.order_id = base.order_id AND shadow.item_id = base.item_id"));
+        assert!(
+            view_sql.contains("shadow.order_id = base.order_id AND shadow.item_id = base.item_id")
+        );
 
         let deleted_sql = generate_deleted_table_sql("sandbox_123", &table);
         assert!(deleted_sql.contains("PRIMARY KEY (order_id, item_id)"));
@@ -585,20 +590,11 @@ mod tests {
 
     #[test]
     fn test_generate_union_view_sql_single_pk() {
-        let columns = vec![
-            "id".to_string(),
-            "name".to_string(),
-            "email".to_string(),
-        ];
+        let columns = vec!["id".to_string(), "name".to_string(), "email".to_string()];
         let pk_columns = vec!["id".to_string()];
 
-        let sql = generate_union_view_sql(
-            "session_abc",
-            "public",
-            "users",
-            &pk_columns,
-            &columns,
-        ).unwrap();
+        let sql = generate_union_view_sql("session_abc", "public", "users", &pk_columns, &columns)
+            .unwrap();
 
         // Check view creation
         assert!(sql.contains(r#"CREATE OR REPLACE VIEW "session_abc"."users""#));
@@ -613,7 +609,9 @@ mod tests {
         assert!(sql.contains(r#""id", "name", "email""#));
 
         // Check NOT IN clauses for shadow and deleted tables (with IS NOT NULL)
-        assert!(sql.contains(r#""id" NOT IN (SELECT "id" FROM "session_abc"."_shadow_users" WHERE "id" IS NOT NULL)"#));
+        assert!(sql.contains(
+            r#""id" NOT IN (SELECT "id" FROM "session_abc"."_shadow_users" WHERE "id" IS NOT NULL)"#
+        ));
         assert!(sql.contains(r#""id" NOT IN (SELECT "id" FROM "session_abc"."_deleted_users" WHERE "id" IS NOT NULL)"#));
     }
 
@@ -633,7 +631,8 @@ mod tests {
             "order_items",
             &pk_columns,
             &columns,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Check composite PK handling with row comparison (with IS NOT NULL)
         assert!(sql.contains(
@@ -648,7 +647,7 @@ mod tests {
     fn test_generate_union_view_sql_special_characters() {
         let columns = vec![
             "id".to_string(),
-            "user name".to_string(),  // space in column name
+            "user name".to_string(),   // space in column name
             "data\"field".to_string(), // quote in column name
         ];
         let pk_columns = vec!["id".to_string()];
@@ -659,7 +658,8 @@ mod tests {
             "table\"name",
             &pk_columns,
             &columns,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Check proper quoting of special characters
         assert!(sql.contains(r#""session-with-dash""#));
@@ -704,13 +704,7 @@ mod tests {
         let columns = vec!["id".to_string(), "name".to_string()];
         let pk_columns: Vec<String> = vec![];
 
-        let result = generate_union_view_sql(
-            "session",
-            "public",
-            "users",
-            &pk_columns,
-            &columns,
-        );
+        let result = generate_union_view_sql("session", "public", "users", &pk_columns, &columns);
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ViewError::NoPrimaryKey(_, _)));
@@ -721,16 +715,13 @@ mod tests {
         let columns: Vec<String> = vec![];
         let pk_columns = vec!["id".to_string()];
 
-        let result = generate_union_view_sql(
-            "session",
-            "public",
-            "users",
-            &pk_columns,
-            &columns,
-        );
+        let result = generate_union_view_sql("session", "public", "users", &pk_columns, &columns);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ViewError::NoColumnsFound(_, _)));
+        assert!(matches!(
+            result.unwrap_err(),
+            ViewError::NoColumnsFound(_, _)
+        ));
     }
 
     #[test]
@@ -739,16 +730,14 @@ mod tests {
         let columns = vec!["id".to_string()];
         let pk_columns = vec!["id".to_string()];
 
-        let result = generate_union_view_sql(
-            "session",
-            "public",
-            &long_name,
-            &pk_columns,
-            &columns,
-        );
+        let result =
+            generate_union_view_sql("session", "public", &long_name, &pk_columns, &columns);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ViewError::IdentifierTooLong(_, 64)));
+        assert!(matches!(
+            result.unwrap_err(),
+            ViewError::IdentifierTooLong(_, 64)
+        ));
     }
 
     #[test]
@@ -757,16 +746,14 @@ mod tests {
         let columns = vec!["id".to_string()];
         let pk_columns = vec!["id".to_string()];
 
-        let result = generate_union_view_sql(
-            &long_schema,
-            "public",
-            "users",
-            &pk_columns,
-            &columns,
-        );
+        let result =
+            generate_union_view_sql(&long_schema, "public", "users", &pk_columns, &columns);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ViewError::IdentifierTooLong(_, 64)));
+        assert!(matches!(
+            result.unwrap_err(),
+            ViewError::IdentifierTooLong(_, 64)
+        ));
     }
 
     #[test]
@@ -776,13 +763,8 @@ mod tests {
         let columns = vec!["id".to_string()];
         let pk_columns = vec!["id".to_string()];
 
-        let result = generate_union_view_sql(
-            "session",
-            "public",
-            &table_name,
-            &pk_columns,
-            &columns,
-        );
+        let result =
+            generate_union_view_sql("session", "public", &table_name, &pk_columns, &columns);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -800,13 +782,7 @@ mod tests {
         let columns = vec!["id".to_string()];
         let pk_columns = vec!["id".to_string()];
 
-        let result = generate_union_view_sql(
-            "s",
-            "public",
-            &table_name,
-            &pk_columns,
-            &columns,
-        );
+        let result = generate_union_view_sql("s", "public", &table_name, &pk_columns, &columns);
 
         assert!(result.is_ok());
     }

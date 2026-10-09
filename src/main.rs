@@ -1,17 +1,17 @@
 use anyhow::Result;
+use deadpool_postgres::{Config as PgConfig, Runtime};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use deadpool_postgres::{Config as PgConfig, Runtime};
 
+mod api;
+mod approval;
+mod config;
 mod proxy;
-mod session;
 mod rewriter;
 mod sandbox;
-mod approval;
-mod api;
-mod config;
+mod session;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,7 +41,10 @@ async fn main() -> Result<()> {
     let pool = pg_config.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)?;
 
     // Create and initialize session manager
-    let session_manager = Arc::new(session::SessionManager::new(pool.clone(), config.session_ttl_seconds));
+    let session_manager = Arc::new(session::SessionManager::new(
+        pool.clone(),
+        config.session_ttl_seconds,
+    ));
     session_manager.init().await?;
 
     // Extract backend address from DATABASE_URL
@@ -62,7 +65,9 @@ async fn main() -> Result<()> {
     let proxy_pool = pool.clone();
     let proxy_shutdown_rx = shutdown_rx.clone();
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::start_server(&proxy_addr, &backend_addr, proxy_pool, proxy_shutdown_rx).await {
+        if let Err(e) =
+            proxy::start_server(&proxy_addr, &backend_addr, proxy_pool, proxy_shutdown_rx).await
+        {
             tracing::error!("Proxy server error: {}", e);
         }
     });
@@ -149,7 +154,8 @@ async fn signal_shutdown() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
@@ -158,7 +164,9 @@ async fn signal_shutdown() {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
         tracing::info!("Received Ctrl+C");
     }
 }

@@ -43,7 +43,10 @@ pub async fn check_conflicts(
 
     for table in tables {
         // Check for modified/deleted rows
-        let rows = client.query(&format!(r#"
+        let rows = client
+            .query(
+                &format!(
+                    r#"
             SELECT
                 es.row_id,
                 es.state_hash as expected_hash,
@@ -55,11 +58,19 @@ pub async fn check_conflicts(
             LEFT JOIN public.{table} p ON p.{pk}::text = es.row_id
             WHERE es.table_name = $1
         "#,
-            schema = quote_ident(schema_name),
-            table = quote_ident(&table.table_name),
-            pk = quote_ident(&table.primary_key),
-            columns = table.hash_columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", "),
-        ), &[&table.table_name]).await?;
+                    schema = quote_ident(schema_name),
+                    table = quote_ident(&table.table_name),
+                    pk = quote_ident(&table.primary_key),
+                    columns = table
+                        .hash_columns
+                        .iter()
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                &[&table.table_name],
+            )
+            .await?;
 
         for row in rows {
             let row_id: String = row.get("row_id");
@@ -95,7 +106,10 @@ pub async fn check_conflicts(
 
         // Check for insert collisions (if we have inserts)
         if table.check_insert_collisions {
-            let collision_rows = client.query(&format!(r#"
+            let collision_rows = client
+                .query(
+                    &format!(
+                        r#"
                 SELECT s.{pk}::text as row_id
                 FROM {schema}.{table} s
                 INNER JOIN public.{table} p ON p.{pk} = s.{pk}
@@ -104,11 +118,14 @@ pub async fn check_conflicts(
                     WHERE table_name = $1
                 )
             "#,
-                schema = quote_ident(schema_name),
-                table = quote_ident(&table.table_name),
-                pk = quote_ident(&table.primary_key),
-                pk_type = table.primary_key_type,
-            ), &[&table.table_name]).await?;
+                        schema = quote_ident(schema_name),
+                        table = quote_ident(&table.table_name),
+                        pk = quote_ident(&table.primary_key),
+                        pk_type = table.primary_key_type,
+                    ),
+                    &[&table.table_name],
+                )
+                .await?;
 
             for row in collision_rows {
                 let row_id: String = row.get("row_id");
@@ -141,30 +158,41 @@ pub async fn get_hash_columns(
     client: &tokio_postgres::Client,
     table_name: &str,
 ) -> Result<Vec<String>, tokio_postgres::Error> {
-    let rows = client.query(r#"
+    let rows = client
+        .query(
+            r#"
         SELECT column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = $1
         ORDER BY ordinal_position
-    "#, &[&table_name]).await?;
+    "#,
+            &[&table_name],
+        )
+        .await?;
 
-    let columns: Vec<String> = rows.iter().map(|row| {
-        let col: String = row.get("column_name");
-        let dtype: String = row.get("data_type");
-        let quoted_col = quote_ident(&col);
+    let columns: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let col: String = row.get("column_name");
+            let dtype: String = row.get("data_type");
+            let quoted_col = quote_ident(&col);
 
-        // Handle NULL values and type coercion for stable hashing
-        match dtype.as_str() {
-            "jsonb" | "json" => format!("COALESCE({}::text, '\\x00')", quoted_col),
-            "timestamp with time zone" | "timestamp without time zone" => {
-                format!("COALESCE(to_char({}, 'YYYY-MM-DD HH24:MI:SS.US'), '\\x00')", quoted_col)
+            // Handle NULL values and type coercion for stable hashing
+            match dtype.as_str() {
+                "jsonb" | "json" => format!("COALESCE({}::text, '\\x00')", quoted_col),
+                "timestamp with time zone" | "timestamp without time zone" => {
+                    format!(
+                        "COALESCE(to_char({}, 'YYYY-MM-DD HH24:MI:SS.US'), '\\x00')",
+                        quoted_col
+                    )
+                }
+                "numeric" | "decimal" | "real" | "double precision" => {
+                    format!("COALESCE({}::numeric::text, '\\x00')", quoted_col)
+                }
+                _ => format!("COALESCE({}::text, '\\x00')", quoted_col),
             }
-            "numeric" | "decimal" | "real" | "double precision" => {
-                format!("COALESCE({}::numeric::text, '\\x00')", quoted_col)
-            }
-            _ => format!("COALESCE({}::text, '\\x00')", quoted_col),
-        }
-    }).collect();
+        })
+        .collect();
 
     Ok(columns)
 }
@@ -319,7 +347,10 @@ pub async fn check_row_hash_conflicts(
         .get("exists");
 
     if !table_exists {
-        debug!(session_schema = session_schema, "No _mlb_row_hashes table, skipping conflict check");
+        debug!(
+            session_schema = session_schema,
+            "No _mlb_row_hashes table, skipping conflict check"
+        );
         return Ok(conflicts);
     }
 
@@ -361,7 +392,8 @@ pub async fn check_row_hash_conflicts(
         let pk_col = get_primary_key_column(client, source_schema, &table_name).await?;
 
         // Get hash columns for stable, deterministic hashing
-        let hash_columns = get_hash_columns(client, &table_name).await
+        let hash_columns = get_hash_columns(client, &table_name)
+            .await
             .map_err(ConflictError::Database)?;
 
         if hash_columns.is_empty() {

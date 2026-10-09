@@ -90,7 +90,10 @@ impl WebhookDispatcher {
     /// Send webhook event and wait for response
     pub async fn send_and_wait(&self, event: WebhookEvent) -> Result<(), WebhookError> {
         let client = self.client.as_ref().ok_or(WebhookError::NotConfigured)?;
-        let url = self.webhook_url.as_ref().ok_or(WebhookError::NotConfigured)?;
+        let url = self
+            .webhook_url
+            .as_ref()
+            .ok_or(WebhookError::NotConfigured)?;
 
         send_webhook(client, url, self.webhook_secret.as_deref(), &event).await
     }
@@ -104,7 +107,8 @@ async fn send_webhook(
 ) -> Result<(), WebhookError> {
     let payload = serde_json::to_string(event).expect("Failed to serialize webhook");
 
-    let mut request = client.post(url)
+    let mut request = client
+        .post(url)
         .header("Content-Type", "application/json")
         .body(payload.clone());
 

@@ -4,8 +4,8 @@
 //! to route reads through views and writes to shadow tables.
 
 use sqlparser::ast::{
-    CopySource, DoUpdate, Expr, ObjectName, OnConflict, OnConflictAction, OnInsert, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    CopySource, DoUpdate, Expr, ObjectName, OnConflict, OnConflictAction, OnInsert, Query, Select,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -43,7 +43,10 @@ pub enum QueryType {
 impl QueryType {
     /// Returns true if this query type modifies data.
     pub fn is_write(&self) -> bool {
-        matches!(self, QueryType::Insert | QueryType::Update | QueryType::Delete)
+        matches!(
+            self,
+            QueryType::Insert | QueryType::Update | QueryType::Delete
+        )
     }
 }
 
@@ -134,11 +137,16 @@ impl Rewriter {
             Statement::Query(query) => {
                 self.extract_tables_from_query(query, &mut tables, false);
             }
-            Statement::Insert { table_name, source, .. } => {
+            Statement::Insert {
+                table_name, source, ..
+            } => {
                 // Target table is a write target
                 if let Some(name) = extract_table_name_str(table_name) {
                     if !is_system_table(&name) {
-                        tables.push(TableRef { name, is_write_target: true });
+                        tables.push(TableRef {
+                            name,
+                            is_write_target: true,
+                        });
                     }
                 }
                 // Source query tables are read targets
@@ -146,7 +154,12 @@ impl Rewriter {
                     self.extract_tables_from_query(src, &mut tables, false);
                 }
             }
-            Statement::Update { table, from, selection, .. } => {
+            Statement::Update {
+                table,
+                from,
+                selection,
+                ..
+            } => {
                 // Target table is a write target
                 self.extract_tables_from_table_with_joins(table, &mut tables, true);
                 // FROM clause is read
@@ -158,7 +171,12 @@ impl Rewriter {
                     self.extract_tables_from_expr(where_expr, &mut tables);
                 }
             }
-            Statement::Delete { from, using, selection, .. } => {
+            Statement::Delete {
+                from,
+                using,
+                selection,
+                ..
+            } => {
                 // Target table(s) are write targets
                 for table_with_joins in from {
                     self.extract_tables_from_table_with_joins(table_with_joins, &mut tables, true);
@@ -166,7 +184,11 @@ impl Rewriter {
                 // USING clause is read
                 if let Some(using_clause) = using {
                     for table_with_joins in using_clause {
-                        self.extract_tables_from_table_with_joins(table_with_joins, &mut tables, false);
+                        self.extract_tables_from_table_with_joins(
+                            table_with_joins,
+                            &mut tables,
+                            false,
+                        );
                     }
                 }
                 // Subqueries in WHERE are read
@@ -194,7 +216,12 @@ impl Rewriter {
         self.extract_tables_from_set_expr(&query.body, tables, is_write);
     }
 
-    fn extract_tables_from_set_expr(&self, set_expr: &SetExpr, tables: &mut Vec<TableRef>, is_write: bool) {
+    fn extract_tables_from_set_expr(
+        &self,
+        set_expr: &SetExpr,
+        tables: &mut Vec<TableRef>,
+        is_write: bool,
+    ) {
         match set_expr {
             SetExpr::Select(select) => {
                 self.extract_tables_from_select(select, tables, is_write);
@@ -210,7 +237,12 @@ impl Rewriter {
         }
     }
 
-    fn extract_tables_from_select(&self, select: &Select, tables: &mut Vec<TableRef>, is_write: bool) {
+    fn extract_tables_from_select(
+        &self,
+        select: &Select,
+        tables: &mut Vec<TableRef>,
+        is_write: bool,
+    ) {
         for table_with_joins in &select.from {
             self.extract_tables_from_table_with_joins(table_with_joins, tables, is_write);
         }
@@ -219,26 +251,41 @@ impl Rewriter {
         }
     }
 
-    fn extract_tables_from_table_with_joins(&self, table: &TableWithJoins, tables: &mut Vec<TableRef>, is_write: bool) {
+    fn extract_tables_from_table_with_joins(
+        &self,
+        table: &TableWithJoins,
+        tables: &mut Vec<TableRef>,
+        is_write: bool,
+    ) {
         self.extract_tables_from_table_factor(&table.relation, tables, is_write);
         for join in &table.joins {
             self.extract_tables_from_table_factor(&join.relation, tables, false);
         }
     }
 
-    fn extract_tables_from_table_factor(&self, factor: &TableFactor, tables: &mut Vec<TableRef>, is_write: bool) {
+    fn extract_tables_from_table_factor(
+        &self,
+        factor: &TableFactor,
+        tables: &mut Vec<TableRef>,
+        is_write: bool,
+    ) {
         match factor {
             TableFactor::Table { name, .. } => {
                 if let Some(table_name) = extract_table_name_str(name) {
                     if !is_system_table(&table_name) {
-                        tables.push(TableRef { name: table_name, is_write_target: is_write });
+                        tables.push(TableRef {
+                            name: table_name,
+                            is_write_target: is_write,
+                        });
                     }
                 }
             }
             TableFactor::Derived { subquery, .. } => {
                 self.extract_tables_from_query(subquery, tables, false);
             }
-            TableFactor::NestedJoin { table_with_joins, .. } => {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
                 self.extract_tables_from_table_with_joins(table_with_joins, tables, is_write);
             }
             _ => {}
@@ -303,9 +350,7 @@ impl Rewriter {
             Statement::AlterTable { .. } => {
                 Err(RewriterError::BlockedStatement("ALTER TABLE".to_string()))
             }
-            Statement::Drop { .. } => {
-                Err(RewriterError::BlockedStatement("DROP".to_string()))
-            }
+            Statement::Drop { .. } => Err(RewriterError::BlockedStatement("DROP".to_string())),
             Statement::Truncate { .. } => {
                 Err(RewriterError::BlockedStatement("TRUNCATE".to_string()))
             }
@@ -335,11 +380,8 @@ impl Rewriter {
             } => {
                 // Target table goes to shadow
                 if !should_skip_rewrite(table_name) {
-                    *table_name = rewrite_table_name(
-                        table_name,
-                        &self.schema,
-                        RewriteContext::Write,
-                    );
+                    *table_name =
+                        rewrite_table_name(table_name, &self.schema, RewriteContext::Write);
                 }
                 // Source query (INSERT ... SELECT) goes to views
                 if let Some(ref mut src) = source {
@@ -408,11 +450,7 @@ impl Rewriter {
                     self.rewrite_select_items(ret);
                 }
             }
-            Statement::Copy {
-                source,
-                to,
-                ..
-            } => {
+            Statement::Copy { source, to, .. } => {
                 // COPY TO (export): reads from view
                 // COPY FROM (import): writes directly to shadow (bypasses triggers)
                 let context = if *to {
@@ -472,13 +510,13 @@ impl Rewriter {
             }
             SetExpr::Insert(stmt) => {
                 // Nested INSERT - stmt is Statement directly (not boxed)
-                if let Statement::Insert { ref mut table_name, .. } = stmt {
+                if let Statement::Insert {
+                    ref mut table_name, ..
+                } = stmt
+                {
                     if !should_skip_rewrite(table_name) {
-                        *table_name = rewrite_table_name(
-                            table_name,
-                            &self.schema,
-                            RewriteContext::Write,
-                        );
+                        *table_name =
+                            rewrite_table_name(table_name, &self.schema, RewriteContext::Write);
                     }
                 }
             }
@@ -570,12 +608,23 @@ impl Rewriter {
             Expr::Nested(inner) => {
                 self.rewrite_expr(inner, context);
             }
-            Expr::Between { expr: inner, low, high, .. } => {
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
                 self.rewrite_expr(inner, context);
                 self.rewrite_expr(low, context);
                 self.rewrite_expr(high, context);
             }
-            Expr::Case { operand, conditions, results, else_result, .. } => {
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
                 if let Some(op) = operand {
                     self.rewrite_expr(op, context);
                 }
@@ -589,7 +638,9 @@ impl Rewriter {
                     self.rewrite_expr(else_expr, context);
                 }
             }
-            Expr::InList { expr: inner, list, .. } => {
+            Expr::InList {
+                expr: inner, list, ..
+            } => {
                 self.rewrite_expr(inner, context);
                 for item in list {
                     self.rewrite_expr(item, context);
@@ -694,9 +745,9 @@ mod tests {
     #[test]
     fn test_select_with_join() {
         let r = rewriter();
-        let (sql, _) = r.rewrite(
-            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id"
-        ).unwrap();
+        let (sql, _) = r
+            .rewrite("SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id")
+            .unwrap();
 
         assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("sandbox_123._view_orders"));
@@ -705,9 +756,9 @@ mod tests {
     #[test]
     fn test_select_with_subquery() {
         let r = rewriter();
-        let (sql, _) = r.rewrite(
-            "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)"
-        ).unwrap();
+        let (sql, _) = r
+            .rewrite("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)")
+            .unwrap();
 
         assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("sandbox_123._view_orders"));
@@ -716,9 +767,11 @@ mod tests {
     #[test]
     fn test_select_with_cte() {
         let r = rewriter();
-        let (sql, _) = r.rewrite(
-            "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active"
-        ).unwrap();
+        let (sql, _) = r
+            .rewrite(
+                "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active",
+            )
+            .unwrap();
 
         assert!(sql.contains("sandbox_123._view_users"));
     }
@@ -726,9 +779,9 @@ mod tests {
     #[test]
     fn test_insert_simple() {
         let r = rewriter();
-        let (sql, query_type) = r.rewrite(
-            "INSERT INTO users (name, email) VALUES ('John', 'john@example.com')"
-        ).unwrap();
+        let (sql, query_type) = r
+            .rewrite("INSERT INTO users (name, email) VALUES ('John', 'john@example.com')")
+            .unwrap();
 
         assert_eq!(query_type, QueryType::Insert);
         // Target should be shadow table
@@ -738,9 +791,11 @@ mod tests {
     #[test]
     fn test_insert_select() {
         let r = rewriter();
-        let (sql, _) = r.rewrite(
-            "INSERT INTO users_archive SELECT * FROM users WHERE created_at < '2024-01-01'"
-        ).unwrap();
+        let (sql, _) = r
+            .rewrite(
+                "INSERT INTO users_archive SELECT * FROM users WHERE created_at < '2024-01-01'",
+            )
+            .unwrap();
 
         // Target is shadow table
         assert!(sql.contains("sandbox_123._view_users_archive"));
@@ -751,9 +806,9 @@ mod tests {
     #[test]
     fn test_update_simple() {
         let r = rewriter();
-        let (sql, query_type) = r.rewrite(
-            "UPDATE users SET name = 'Jane' WHERE id = 1"
-        ).unwrap();
+        let (sql, query_type) = r
+            .rewrite("UPDATE users SET name = 'Jane' WHERE id = 1")
+            .unwrap();
 
         assert_eq!(query_type, QueryType::Update);
         assert!(sql.contains("sandbox_123._view_users"));
@@ -762,9 +817,11 @@ mod tests {
     #[test]
     fn test_update_with_from() {
         let r = rewriter();
-        let (sql, _) = r.rewrite(
-            "UPDATE users SET total = orders.sum FROM orders WHERE users.id = orders.user_id"
-        ).unwrap();
+        let (sql, _) = r
+            .rewrite(
+                "UPDATE users SET total = orders.sum FROM orders WHERE users.id = orders.user_id",
+            )
+            .unwrap();
 
         // Target is shadow table
         assert!(sql.contains("UPDATE sandbox_123._view_users"));
@@ -827,7 +884,11 @@ mod tests {
         let (sql, qt) = r.rewrite("COPY users FROM '/tmp/data.csv'").unwrap();
 
         assert_eq!(qt, QueryType::Other);
-        assert!(sql.contains("_shadow_users"), "Expected shadow table in: {}", sql);
+        assert!(
+            sql.contains("_shadow_users"),
+            "Expected shadow table in: {}",
+            sql
+        );
     }
 
     #[test]
@@ -879,7 +940,9 @@ mod tests {
     #[test]
     fn test_complex_query() {
         let r = rewriter();
-        let (sql, _) = r.rewrite(r#"
+        let (sql, _) = r
+            .rewrite(
+                r#"
             WITH recent_orders AS (
                 SELECT user_id, SUM(total) as total
                 FROM orders
@@ -892,7 +955,9 @@ mod tests {
             WHERE u.active = true
             AND EXISTS (SELECT 1 FROM payments p WHERE p.user_id = u.id)
             ORDER BY ro.total DESC
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         assert!(sql.contains("sandbox_123._view_orders"));
         assert!(sql.contains("sandbox_123._view_users"));
@@ -902,9 +967,9 @@ mod tests {
     #[test]
     fn test_insert_on_conflict_do_nothing() {
         let r = rewriter();
-        let (sql, query_type) = r.rewrite(
-            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO NOTHING"
-        ).unwrap();
+        let (sql, query_type) = r
+            .rewrite("INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO NOTHING")
+            .unwrap();
 
         assert_eq!(query_type, QueryType::Insert);
         assert!(sql.contains("sandbox_123._view_users"));
@@ -941,9 +1006,9 @@ mod tests {
     #[test]
     fn test_insert_returning() {
         let r = rewriter();
-        let (sql, query_type) = r.rewrite(
-            "INSERT INTO users (name) VALUES ('John') RETURNING id, name"
-        ).unwrap();
+        let (sql, query_type) = r
+            .rewrite("INSERT INTO users (name) VALUES ('John') RETURNING id, name")
+            .unwrap();
 
         assert_eq!(query_type, QueryType::Insert);
         assert!(sql.contains("sandbox_123._view_users"));
@@ -953,9 +1018,9 @@ mod tests {
     #[test]
     fn test_insert_returning_star() {
         let r = rewriter();
-        let (sql, _) = r.rewrite(
-            "INSERT INTO users (name) VALUES ('John') RETURNING *"
-        ).unwrap();
+        let (sql, _) = r
+            .rewrite("INSERT INTO users (name) VALUES ('John') RETURNING *")
+            .unwrap();
 
         assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("RETURNING *"));
@@ -964,9 +1029,9 @@ mod tests {
     #[test]
     fn test_update_returning() {
         let r = rewriter();
-        let (sql, query_type) = r.rewrite(
-            "UPDATE users SET name = 'Jane' WHERE id = 1 RETURNING id, name, updated_at"
-        ).unwrap();
+        let (sql, query_type) = r
+            .rewrite("UPDATE users SET name = 'Jane' WHERE id = 1 RETURNING id, name, updated_at")
+            .unwrap();
 
         assert_eq!(query_type, QueryType::Update);
         assert!(sql.contains("sandbox_123._view_users"));
@@ -976,9 +1041,9 @@ mod tests {
     #[test]
     fn test_delete_returning() {
         let r = rewriter();
-        let (sql, query_type) = r.rewrite(
-            "DELETE FROM users WHERE id = 1 RETURNING *"
-        ).unwrap();
+        let (sql, query_type) = r
+            .rewrite("DELETE FROM users WHERE id = 1 RETURNING *")
+            .unwrap();
 
         assert_eq!(query_type, QueryType::Delete);
         assert!(sql.contains("sandbox_123._view_users"));
@@ -1100,7 +1165,9 @@ mod edge_case_tests {
 
     #[test]
     fn test_array_any() {
-        assert!(test_parse("SELECT * FROM users WHERE id = ANY(ARRAY[1,2,3])"));
+        assert!(test_parse(
+            "SELECT * FROM users WHERE id = ANY(ARRAY[1,2,3])"
+        ));
     }
 
     #[test]
@@ -1125,22 +1192,30 @@ mod edge_case_tests {
 
     #[test]
     fn test_lateral_join() {
-        assert!(test_parse("SELECT * FROM users u, LATERAL (SELECT * FROM orders WHERE user_id = u.id) o"));
+        assert!(test_parse(
+            "SELECT * FROM users u, LATERAL (SELECT * FROM orders WHERE user_id = u.id) o"
+        ));
     }
 
     #[test]
     fn test_window_function() {
-        assert!(test_parse("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp"));
+        assert!(test_parse(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp"
+        ));
     }
 
     #[test]
     fn test_distinct_on() {
-        assert!(test_parse("SELECT DISTINCT ON (dept) * FROM emp ORDER BY dept, salary DESC"));
+        assert!(test_parse(
+            "SELECT DISTINCT ON (dept) * FROM emp ORDER BY dept, salary DESC"
+        ));
     }
 
     #[test]
     fn test_filter_clause() {
-        assert!(test_parse("SELECT COUNT(*) FILTER (WHERE active) FROM users"));
+        assert!(test_parse(
+            "SELECT COUNT(*) FILTER (WHERE active) FROM users"
+        ));
     }
 
     #[test]
@@ -1160,6 +1235,8 @@ mod edge_case_tests {
 
     #[test]
     fn test_excluded_in_upsert() {
-        assert!(test_parse("INSERT INTO t (a,b) VALUES (1,2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b"));
+        assert!(test_parse(
+            "INSERT INTO t (a,b) VALUES (1,2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b"
+        ));
     }
 }

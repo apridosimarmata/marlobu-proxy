@@ -41,7 +41,8 @@ pub async fn stage_delete(
     where_clause: &str,
 ) -> Result<u64, WriteError> {
     // 1. Capture expected state for conflict detection
-    let capture_sql = format!(r#"
+    let capture_sql = format!(
+        r#"
         INSERT INTO {schema}._expected_state (table_name, row_id, state_hash)
         SELECT
             '{table}',
@@ -59,7 +60,8 @@ pub async fn stage_delete(
     client.execute(&capture_sql, &[]).await?;
 
     // 2. Record deletion in _deletes
-    let record_sql = format!(r#"
+    let record_sql = format!(
+        r#"
         INSERT INTO {schema}._deletes (table_name, row_id)
         SELECT '{table}', {pk}::text
         FROM public.{table}
@@ -74,7 +76,8 @@ pub async fn stage_delete(
     let deleted = client.execute(&record_sql, &[]).await?;
 
     // 3. Also delete from shadow if row exists there
-    let shadow_delete = format!(r#"
+    let shadow_delete = format!(
+        r#"
         DELETE FROM {schema}.{table}
         WHERE {where_clause}
     "#,
@@ -101,7 +104,10 @@ pub fn should_block(sql_upper: &str) -> Option<&'static str> {
         ("NOTIFY ", "NOTIFY not allowed in sandbox"),
         ("LOCK ", "LOCK not allowed in sandbox"),
         ("SET ROLE", "SET ROLE not allowed in sandbox"),
-        ("SET SESSION AUTHORIZATION", "Session auth changes not allowed"),
+        (
+            "SET SESSION AUTHORIZATION",
+            "Session auth changes not allowed",
+        ),
     ];
 
     for (pattern, reason) in blocked {
@@ -111,7 +117,10 @@ pub fn should_block(sql_upper: &str) -> Option<&'static str> {
     }
 
     // Also block sequence operations
-    if sql_upper.contains("NEXTVAL") || sql_upper.contains("SETVAL") || sql_upper.contains("CURRVAL") {
+    if sql_upper.contains("NEXTVAL")
+        || sql_upper.contains("SETVAL")
+        || sql_upper.contains("CURRVAL")
+    {
         return Some("Sequence operations not allowed in sandbox");
     }
 

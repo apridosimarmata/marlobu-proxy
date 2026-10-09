@@ -168,10 +168,8 @@ async fn generate_table_diff(
     );
 
     let columns = get_table_columns(client, source_schema, table_name).await?;
-    let column_list: Result<Vec<String>, DiffError> = columns
-        .iter()
-        .map(|c| safe_quote_ident(c))
-        .collect();
+    let column_list: Result<Vec<String>, DiffError> =
+        columns.iter().map(|c| safe_quote_ident(c)).collect();
     let column_list = column_list?.join(", ");
 
     // Find INSERTs
