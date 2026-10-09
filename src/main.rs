@@ -8,6 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod api;
 mod approval;
 mod config;
+mod metrics;
 mod proxy;
 mod rewriter;
 mod sandbox;

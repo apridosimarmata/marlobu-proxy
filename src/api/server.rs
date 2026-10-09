@@ -10,12 +10,18 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
 use crate::config::Config;
+use crate::metrics;
 use crate::session::SessionManager;
 
 use super::handlers::{
     approve_session, create_session, delete_session, get_mutations, get_session, get_session_diff,
     health_check, propose_session, reject_session, AppState,
 };
+
+/// Prometheus metrics endpoint
+async fn metrics_handler() -> String {
+    metrics::export_metrics()
+}
 
 /// Build the API router with all routes
 pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
@@ -35,8 +41,9 @@ pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
         // Session data
         .route("/sessions/:id/mutations", get(get_mutations))
         .route("/sessions/:id/diff", get(get_session_diff))
-        // Health
+        // Observability
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
         // Middleware
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
