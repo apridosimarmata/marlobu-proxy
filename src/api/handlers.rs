@@ -7,8 +7,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::approval::conflict::{check_row_hash_conflicts, ConflictType};
+use crate::approval::diff::{generate_session_diff, SessionDiff};
 use crate::session::{Session, SessionManager, SessionStatus};
 
 // ============================================================================
@@ -61,16 +64,16 @@ pub struct ApproveResponse {
 #[derive(Debug, Serialize)]
 pub struct ConflictResponse {
     pub status: String,
-    pub conflicts: Vec<Conflict>,
+    pub conflicts: Vec<ConflictDetail>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct Conflict {
+pub struct ConflictDetail {
     pub table: String,
-    pub row_id: String,
+    pub pk_value: String,
     pub conflict_type: String,
-    pub session_value: Option<serde_json::Value>,
-    pub current_value: Option<serde_json::Value>,
+    pub captured_hash: String,
+    pub current_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,26 +219,224 @@ pub async fn approve_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    // TODO: Implement actual conflict detection and apply
-    match state.session_manager.update_status(id, SessionStatus::Approved).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApproveResponse {
-                status: "approved".to_string(),
-                applied: 0,
-            })
-            .unwrap()),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::to_value(ErrorResponse {
+    // 1. Get session and verify it's in PendingReview status
+    let session = match state.session_manager.get(id).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::to_value(ErrorResponse {
                     error: e.to_string(),
-                })
-                .unwrap(),
-            ),
-        ),
+                }).unwrap()),
+            );
+        }
+    };
+
+    if session.status != SessionStatus::PendingReview {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ErrorResponse {
+                error: format!(
+                    "Session must be in pending_review status to approve (current: {})",
+                    session.status.as_str()
+                ),
+            }).unwrap()),
+        );
     }
+
+    // 2. Get database client from pool
+    let client = match state.session_manager.pool().get().await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to get database connection");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ErrorResponse {
+                    error: "Database connection error".to_string(),
+                }).unwrap()),
+            );
+        }
+    };
+
+    // 3. Check for conflicts using row hash comparison
+    let conflicts = match check_row_hash_conflicts(&client, &session.schema_name, "public").await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, session_id = %id, "Failed to check conflicts");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ErrorResponse {
+                    error: format!("Conflict check failed: {}", e),
+                }).unwrap()),
+            );
+        }
+    };
+
+    // 4. If conflicts exist, return them to client
+    if !conflicts.is_empty() {
+        info!(
+            session_id = %id,
+            conflict_count = conflicts.len(),
+            "Conflicts detected, cannot approve"
+        );
+
+        let conflict_details: Vec<ConflictDetail> = conflicts
+            .into_iter()
+            .map(|c| ConflictDetail {
+                table: c.table,
+                pk_value: c.pk_value,
+                conflict_type: match c.conflict_type {
+                    ConflictType::RowModified => "row_modified".to_string(),
+                    ConflictType::RowDeleted => "row_deleted".to_string(),
+                    ConflictType::InsertCollision => "insert_collision".to_string(),
+                },
+                captured_hash: c.captured_hash,
+                current_hash: c.current_hash,
+            })
+            .collect();
+
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::to_value(ConflictResponse {
+                status: "conflicts".to_string(),
+                conflicts: conflict_details,
+            }).unwrap()),
+        );
+    }
+
+    // 5. No conflicts - apply changes from shadow to production
+    let applied = match apply_shadow_to_production(&client, &session).await {
+        Ok(count) => count,
+        Err(e) => {
+            error!(error = %e, session_id = %id, "Failed to apply changes");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ErrorResponse {
+                    error: format!("Failed to apply changes: {}", e),
+                }).unwrap()),
+            );
+        }
+    };
+
+    // 6. Update session status to Approved
+    if let Err(e) = state.session_manager.update_status(id, SessionStatus::Approved).await {
+        error!(error = %e, session_id = %id, "Failed to update session status");
+        // Changes already applied, log error but continue
+    }
+
+    // 7. Drop the session schema after successful apply
+    if let Err(e) = state.session_manager.schema_manager().drop_session_schema(&session.schema_name).await {
+        error!(error = %e, session_id = %id, "Failed to drop session schema");
+        // Not critical, schema can be cleaned up later
+    }
+
+    info!(
+        session_id = %id,
+        applied = applied,
+        "Session approved and changes applied"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(ApproveResponse {
+            status: "approved".to_string(),
+            applied,
+        }).unwrap()),
+    )
+}
+
+/// Apply shadow table changes to production
+async fn apply_shadow_to_production(
+    client: &deadpool_postgres::Client,
+    session: &Session,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut total_applied = 0;
+
+    for (table_name, table_state) in &session.tables {
+        if !table_state.shadow_created {
+            continue;
+        }
+
+        let pk = &table_state.primary_key;
+        let schema = &session.schema_name;
+
+        // Apply INSERTs (rows in shadow not in prod)
+        let insert_sql = format!(
+            r#"
+            INSERT INTO public."{table}"
+            SELECT s.* FROM "{schema}"."{table}" s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+            )
+            "#,
+            schema = schema,
+            table = table_name,
+            pk = pk,
+        );
+        let inserted = client.execute(&insert_sql, &[]).await?;
+        total_applied += inserted as usize;
+
+        // Apply UPDATEs (rows in both shadow and prod)
+        // Get columns for update
+        let columns: Vec<String> = client
+            .query(
+                r#"
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                  AND column_name != $2
+                ORDER BY ordinal_position
+                "#,
+                &[&table_name, &pk],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get("column_name"))
+            .collect();
+
+        if !columns.is_empty() {
+            let set_clause = columns
+                .iter()
+                .map(|col| format!(r#""{col}" = s."{col}""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let update_sql = format!(
+                r#"
+                UPDATE public."{table}" p
+                SET {set_clause}
+                FROM "{schema}"."{table}" s
+                WHERE p."{pk}" = s."{pk}"
+                "#,
+                schema = schema,
+                table = table_name,
+                pk = pk,
+                set_clause = set_clause,
+            );
+            let updated = client.execute(&update_sql, &[]).await?;
+            total_applied += updated as usize;
+        }
+
+        // Apply DELETEs (check _mlb_deletes table if it exists)
+        let delete_sql = format!(
+            r#"
+            DELETE FROM public."{table}"
+            WHERE "{pk}"::text IN (
+                SELECT pk_value FROM "{schema}"._mlb_deletes WHERE table_name = $1
+            )
+            "#,
+            schema = schema,
+            table = table_name,
+            pk = pk,
+        );
+        // Ignore error if _mlb_deletes doesn't exist
+        if let Ok(deleted) = client.execute(&delete_sql, &[&table_name]).await {
+            total_applied += deleted as usize;
+        }
+    }
+
+    Ok(total_applied)
 }
 
 /// POST /sessions/:id/reject - Reject and discard session
@@ -280,4 +481,3 @@ pub async fn health_check() -> Json<HealthResponse> {
         timestamp: Utc::now(),
     })
 }
-

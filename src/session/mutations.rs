@@ -61,12 +61,12 @@ pub async fn get_session_mutations(
             let query = format!(
                 r#"
                 SELECT {pk}::text as row_id, _mlb_op as operation, _mlb_ts as timestamp
-                FROM "{schema}"."{table}"
+                FROM {schema}.{table}
                 ORDER BY _mlb_ts
                 "#,
                 pk = quote_ident(&pk_col),
-                schema = schema_name,
-                table = shadow_table_name,
+                schema = quote_ident(schema_name),
+                table = quote_ident(&shadow_table_name),
             );
 
             let records = client.query(&query, &[]).await?;
@@ -124,12 +124,12 @@ pub async fn get_session_mutations(
             let query = format!(
                 r#"
                 SELECT {row_id_expr} as row_id, _mlb_ts as timestamp
-                FROM "{schema}"."{table}"
+                FROM {schema}.{table}
                 ORDER BY _mlb_ts
                 "#,
                 row_id_expr = row_id_expr,
-                schema = schema_name,
-                table = deleted_table_name,
+                schema = quote_ident(schema_name),
+                table = quote_ident(&deleted_table_name),
             );
 
             let records = client.query(&query, &[]).await?;
