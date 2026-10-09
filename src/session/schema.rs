@@ -163,7 +163,16 @@ impl SchemaManager {
         }
 
         let shadow_table = format!("{}.{}", quote_ident(session_schema), quote_ident(&shadow_name));
-        let exists = self.table_exists(&client, session_schema, &shadow_name).await?;
+        let exists = match self.table_exists(&client, session_schema, &shadow_name).await {
+            Ok(e) => e,
+            Err(e) => {
+                // Release lock before returning error to prevent deadlocks
+                let _ = client
+                    .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+                    .await;
+                return Err(e);
+            }
+        };
 
         if exists {
             debug!(
@@ -426,11 +435,30 @@ impl SchemaManager {
                 .await?;
         }
 
-        let exists = self
+        let exists = match self
             .table_exists(&client, session_schema, &deleted_table_name)
-            .await?;
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                // Release lock before returning error to prevent deadlocks
+                let _ = client
+                    .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+                    .await;
+                return Err(e);
+            }
+        };
 
-        let pk_columns = self.get_primary_key_columns(source_schema, table_name).await?;
+        let pk_columns = match self.get_primary_key_columns(source_schema, table_name).await {
+            Ok(cols) => cols,
+            Err(e) => {
+                // Release lock before returning error to prevent deadlocks
+                let _ = client
+                    .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+                    .await;
+                return Err(e);
+            }
+        };
 
         let full_table_name = format!(
             "{}.{}",
@@ -578,7 +606,12 @@ impl SchemaManager {
             )));
         }
 
-        let placeholders: Vec<String> = (1..=values.len()).map(|i| format!("${}", i)).collect();
+        // Use explicit casts to handle non-text PKs (integers, UUIDs, etc.)
+        let placeholders: Vec<String> = pk_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("${}::{}", i + 1, col.data_type))
+            .collect();
 
         let insert_sql = format!(
             "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
