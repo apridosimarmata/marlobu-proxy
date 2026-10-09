@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,8 +21,8 @@ pub enum WriteError {
 /// Inserts go directly to the shadow table
 pub async fn stage_insert(
     client: &tokio_postgres::Client,
-    schema_name: &str,
-    table_name: &str,
+    _schema_name: &str,
+    _table_name: &str,
     rewritten_sql: &str,
 ) -> Result<u64, WriteError> {
     // Shadow table should already exist at this point

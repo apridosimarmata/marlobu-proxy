@@ -79,8 +79,6 @@ async fn shutdown_signal(mut rx: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_router_builds() {
         // This test verifies the router can be constructed without panicking

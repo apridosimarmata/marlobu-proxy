@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! View SQL generation for sandbox isolation.
 //!
 //! Generates CREATE VIEW statements that union base table data with shadow table

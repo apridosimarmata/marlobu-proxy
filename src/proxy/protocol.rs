@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Postgres wire protocol message parsing and encoding helpers.
 //!
 //! Reference: https://www.postgresql.org/docs/current/protocol-message-formats.html
@@ -197,7 +198,7 @@ fn is_startup_message(buf: &BytesMut) -> Result<bool, ProtocolError> {
     }
 
     // Startup message starts with length, then protocol version
-    if len >= 8 && len <= 10000 {
+    if (8..=10000).contains(&len) {
         let version = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         if version == PROTOCOL_VERSION_3 {
             return Ok(true);

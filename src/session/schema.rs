@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use deadpool_postgres::Pool;
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};

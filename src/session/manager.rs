@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::map_entry)]
+#![allow(clippy::unnecessary_get_then_check)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -357,7 +361,7 @@ impl SessionManager {
     ) -> SessionResult<Session> {
         let mut session = self.get_active(session_id).await?;
 
-        session.expires_at = session.expires_at + Duration::seconds(additional_seconds);
+        session.expires_at += Duration::seconds(additional_seconds);
         self.store.update(&session).await?;
 
         debug!(
