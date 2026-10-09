@@ -557,6 +557,7 @@ pub async fn reject_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // First update status to Rejected
     state
         .session_manager
         .update_status(id, SessionStatus::Rejected)
@@ -566,6 +567,20 @@ pub async fn reject_session(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: e.to_string(),
+                }),
+            )
+        })?;
+
+    // Then destroy the session (drop schema and remove from store)
+    state
+        .session_manager
+        .destroy(id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to cleanup session: {}", e),
                 }),
             )
         })?;
@@ -671,37 +686,3 @@ pub async fn health_check() -> Json<HealthResponse> {
     })
 }
 
-/// GET /sessions/:id/diff - Get diff of all changes in a session
-pub async fn get_session_diff(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<SessionDiff>, (StatusCode, Json<ErrorResponse>)> {
-    let session = state.session_manager.get(id).await.map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let tables = generate_session_diff(
-        state.session_manager.pool(),
-        &session.schema_name,
-        "public",
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    Ok(Json(SessionDiff {
-        session_id: id.to_string(),
-        tables,
-    }))
-}

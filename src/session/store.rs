@@ -230,6 +230,26 @@ impl SessionStore {
         rows.into_iter().map(Self::row_to_session).collect()
     }
 
+    /// List sessions needing cleanup (expired active sessions OR any non-terminal sessions past TTL)
+    pub async fn list_needing_cleanup(&self) -> StoreResult<Vec<Session>> {
+        let client = self.pool.get().await?;
+        let now = Utc::now();
+
+        let rows = client
+            .query(
+                r#"
+                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                FROM _marlobu_sessions
+                WHERE (expires_at < $1 AND status IN ('active', 'pending_review'))
+                   OR status IN ('expired', 'rejected')
+                "#,
+                &[&now],
+            )
+            .await?;
+
+        rows.into_iter().map(Self::row_to_session).collect()
+    }
+
     /// Invalidate cache entry
     pub async fn invalidate_cache(&self, id: Uuid) {
         let mut cache = self.cache.write().await;
