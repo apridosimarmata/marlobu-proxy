@@ -1,0 +1,23 @@
+#!/bin/bash
+# Enforce ticket number in commit messages
+# Format: type(MLB-XXX): message
+# Example: feat(MLB-012): add sequence handling
+
+commit_msg=$(cat "$1")
+
+# Pattern: type(MLB-XXX): message
+pattern="^(feat|fix|docs|style|refactor|test|chore)\(MLB-[0-9]+\): .+"
+
+if ! echo "$commit_msg" | grep -qE "$pattern"; then
+    echo "❌ Invalid commit message format!"
+    echo ""
+    echo "Expected: type(MLB-XXX): description"
+    echo "Example:  feat(MLB-012): add sequence handling"
+    echo ""
+    echo "Types: feat, fix, docs, style, refactor, test, chore"
+    echo ""
+    echo "Your message: $commit_msg"
+    exit 1
+fi
+
+echo "✓ Commit message format OK"
