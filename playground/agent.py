@@ -23,6 +23,13 @@ DATABASE_NAME = os.getenv("DATABASE_NAME", "marlobu_playground")
 DATABASE_USER = os.getenv("DATABASE_USER", "postgres")
 DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD", "postgres")
 
+# LLM config - supports OpenAI-compatible endpoints
+LLM_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+LLM_BASE_URL = os.getenv("OPENAI_BASE_URL") or os.getenv("ANTHROPIC_BASE_URL")
+if LLM_BASE_URL and not LLM_BASE_URL.endswith("/v1"):
+    LLM_BASE_URL = f"{LLM_BASE_URL}/v1"
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")
+
 
 class MarlobuSession:
     """Manages a marlobu session with create/approve/reject lifecycle."""
@@ -90,7 +97,7 @@ class MarlobuSession:
 
 def create_marlobu_agent(
     session: MarlobuSession,
-    model: str = "gpt-4o-mini",
+    model: str = None,
     temperature: float = 0,
     verbose: bool = True
 ):
@@ -101,10 +108,15 @@ def create_marlobu_agent(
 
     db = SQLDatabase.from_uri(
         session.get_connection_string(),
-        connect_args=session.get_connect_args()
+        engine_args={"connect_args": session.get_connect_args()}
     )
 
-    llm = ChatOpenAI(model=model, temperature=temperature)
+    llm = ChatOpenAI(
+        model=model or LLM_MODEL,
+        temperature=temperature,
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL
+    )
 
     agent = create_sql_agent(
         llm,
