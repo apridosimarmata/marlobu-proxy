@@ -15,6 +15,9 @@ pub enum DiffError {
 
     #[error("Session schema not found: {0}")]
     SchemaNotFound(String),
+
+    #[error("Invalid identifier: {0}")]
+    InvalidIdentifier(String),
 }
 
 /// A single row change
@@ -124,22 +127,22 @@ async fn generate_table_diff(
     let pk_column = get_primary_key_column(client, source_schema, table_name).await?;
     let shadow_table = format!(
         "{}.{}",
-        quote_ident(schema_name),
-        quote_ident(&format!("_shadow_{}", table_name))
+        safe_quote_ident(schema_name)?,
+        safe_quote_ident(&format!("_shadow_{}", table_name))?
     );
     let source_table = format!(
         "{}.{}",
-        quote_ident(source_schema),
-        quote_ident(table_name)
+        safe_quote_ident(source_schema)?,
+        safe_quote_ident(table_name)?
     );
 
     // Get columns for the table (excluding _mlb_* tracking columns)
     let columns = get_table_columns(client, source_schema, table_name).await?;
-    let column_list = columns
+    let column_list: Result<Vec<String>, DiffError> = columns
         .iter()
-        .map(|c| quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .map(|c| safe_quote_ident(c))
+        .collect();
+    let column_list = column_list?.join(", ");
 
     // 1. Find INSERTs: rows in shadow that don't exist in source
     let insert_query = format!(
@@ -156,7 +159,7 @@ async fn generate_table_diff(
         columns = column_list,
         shadow = shadow_table,
         source = source_table,
-        pk = quote_ident(&pk_column),
+        pk = safe_quote_ident(&pk_column)?,
     );
 
     let insert_rows = client.query(&insert_query, &[]).await?;
@@ -184,7 +187,7 @@ async fn generate_table_diff(
         columns = column_list,
         shadow = shadow_table,
         source = source_table,
-        pk = quote_ident(&pk_column),
+        pk = safe_quote_ident(&pk_column)?,
     );
 
     let update_rows = client.query(&update_query, &[]).await?;
@@ -204,7 +207,7 @@ async fn generate_table_diff(
     );
 
     // 3. Find DELETEs: check _deleted_<table> table if it exists
-    let deletes = get_deletes(client, schema_name, source_schema, table_name, &pk_column).await?;
+    let deletes = get_deletes(client, schema_name, table_name).await?;
 
     debug!(
         table = table_name,
@@ -220,13 +223,12 @@ async fn generate_table_diff(
     })
 }
 
-/// Get deleted rows for a table
+/// Get deleted rows for a table.
+/// Reads directly from the _deleted_ table which stores the full row data at deletion time.
 async fn get_deletes(
     client: &tokio_postgres::Client,
     schema_name: &str,
-    source_schema: &str,
     table_name: &str,
-    pk_column: &str,
 ) -> Result<Vec<serde_json::Value>, DiffError> {
     let deleted_table_name = format!("_deleted_{}", table_name);
 
@@ -250,25 +252,19 @@ async fn get_deletes(
 
     let deleted_table = format!(
         "{}.{}",
-        quote_ident(schema_name),
-        quote_ident(&deleted_table_name)
-    );
-    let source_table = format!(
-        "{}.{}",
-        quote_ident(source_schema),
-        quote_ident(table_name)
+        safe_quote_ident(schema_name)?,
+        safe_quote_ident(&deleted_table_name)?
     );
 
-    // Get the full row data from source for deleted rows
+    // Get the deleted row data directly from the _deleted_ table.
+    // The _deleted_ table stores the full row snapshot at deletion time,
+    // so we don't need to join with source (which may no longer have the row).
     let delete_query = format!(
         r#"
-        SELECT row_to_json(p.*) as data
-        FROM {source} p
-        INNER JOIN {deleted} d ON p.{pk}::text = d.{pk}::text
+        SELECT row_to_json(d.*) as data
+        FROM {deleted} d
         "#,
-        source = source_table,
         deleted = deleted_table,
-        pk = quote_ident(pk_column),
     );
 
     let delete_rows = client.query(&delete_query, &[]).await?;
@@ -277,7 +273,7 @@ async fn get_deletes(
     Ok(deletes)
 }
 
-/// Get all non-system columns for a table
+/// Get all non-system columns for a table (excluding _mlb_* tracking columns)
 async fn get_table_columns(
     client: &tokio_postgres::Client,
     schema_name: &str,
@@ -289,6 +285,7 @@ async fn get_table_columns(
             SELECT column_name
             FROM information_schema.columns
             WHERE table_schema = $1 AND table_name = $2
+              AND column_name NOT LIKE '_mlb_%'
             ORDER BY ordinal_position
             "#,
             &[&schema_name, &table_name],
@@ -330,9 +327,38 @@ async fn get_primary_key_column(
     }
 }
 
-/// Quote an identifier to prevent SQL injection
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
+/// Validates that an identifier contains only safe characters for SQL identifiers.
+fn validate_identifier(ident: &str) -> Result<(), DiffError> {
+    if ident.is_empty() {
+        return Err(DiffError::InvalidIdentifier("empty string".to_string()));
+    }
+    if ident.contains('\0') {
+        return Err(DiffError::InvalidIdentifier(
+            "contains null byte".to_string(),
+        ));
+    }
+    if ident.len() > 63 {
+        return Err(DiffError::InvalidIdentifier(
+            "exceeds maximum length of 63 characters".to_string(),
+        ));
+    }
+    // Allow only alphanumeric, underscore, and hyphen
+    let is_valid = ident
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !is_valid {
+        return Err(DiffError::InvalidIdentifier(format!(
+            "identifier contains invalid characters: {}",
+            ident
+        )));
+    }
+    Ok(())
+}
+
+/// Safely quote an identifier after validating it contains only safe characters.
+fn safe_quote_ident(ident: &str) -> Result<String, DiffError> {
+    validate_identifier(ident)?;
+    Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
 }
 
 #[cfg(test)]
@@ -389,9 +415,26 @@ mod tests {
     }
 
     #[test]
-    fn test_quote_ident() {
-        assert_eq!(quote_ident("users"), "\"users\"");
-        assert_eq!(quote_ident("my_table"), "\"my_table\"");
-        assert_eq!(quote_ident("with\"quote"), "\"with\"\"quote\"");
+    fn test_safe_quote_ident() {
+        assert_eq!(safe_quote_ident("users").unwrap(), "\"users\"");
+        assert_eq!(safe_quote_ident("my_table").unwrap(), "\"my_table\"");
+        assert_eq!(safe_quote_ident("with-hyphen").unwrap(), "\"with-hyphen\"");
+    }
+
+    #[test]
+    fn test_safe_quote_ident_rejects_invalid() {
+        assert!(safe_quote_ident("with\"quote").is_err());
+        assert!(safe_quote_ident("with;semicolon").is_err());
+        assert!(safe_quote_ident("").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier() {
+        assert!(validate_identifier("users").is_ok());
+        assert!(validate_identifier("_shadow_users").is_ok());
+        assert!(validate_identifier("uuid-123-abc").is_ok());
+        assert!(validate_identifier("with space").is_err());
+        assert!(validate_identifier("with\"quote").is_err());
+        assert!(validate_identifier("").is_err());
     }
 }
