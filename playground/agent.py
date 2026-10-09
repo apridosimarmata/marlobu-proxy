@@ -21,7 +21,7 @@ MARLOBU_PROXY = os.getenv("MARLOBU_PROXY_HOST", "localhost")
 MARLOBU_PROXY_PORT = os.getenv("MARLOBU_PROXY_PORT", "5433")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "marlobu_playground")
 DATABASE_USER = os.getenv("DATABASE_USER", "postgres")
-DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD", "postgres")
+DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD", "")
 
 # LLM config - supports OpenAI-compatible endpoints
 LLM_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
