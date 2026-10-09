@@ -1,6 +1,6 @@
 use deadpool_postgres::Pool;
 use thiserror::Error;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// Represents a primary key column with its name and PostgreSQL data type
 #[derive(Debug, Clone)]
@@ -89,6 +89,21 @@ impl SchemaManager {
             quote_ident(schema_name)
         );
         client.execute(&create_expected, &[]).await?;
+
+        // Create _mlb_row_hashes table for conflict detection
+        let create_hashes = format!(
+            r#"
+            CREATE TABLE {}._mlb_row_hashes (
+                table_name VARCHAR(255) NOT NULL,
+                pk_value VARCHAR(255) NOT NULL,
+                hash VARCHAR(32) NOT NULL,
+                captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (table_name, pk_value)
+            )
+            "#,
+            quote_ident(schema_name)
+        );
+        client.execute(&create_hashes, &[]).await?;
 
         debug!(schema = schema_name, "Created tracking tables");
 
@@ -211,6 +226,89 @@ impl SchemaManager {
                     .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
                     .await;
                 return Err(SchemaError::Database(e));
+            }
+        }
+
+        // Get primary key and columns for hash capture trigger
+        if let Ok(pk_col) = self.get_primary_key(source_schema, table_name).await {
+            // Get all columns for hash computation (exclude _mlb_* columns)
+            let columns: Vec<String> = client
+                .query(
+                    r#"
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = $1 AND table_name = $2
+                    ORDER BY ordinal_position
+                    "#,
+                    &[&source_schema, &table_name],
+                )
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.get::<_, String>("column_name"))
+                .collect();
+
+            if !columns.is_empty() {
+                let hash_cols = columns
+                    .iter()
+                    .map(|c| format!("p.{}", quote_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let func_name = format!(
+                    "{}.capture_hash_{}",
+                    quote_ident(session_schema),
+                    safe_ident(table_name)
+                );
+
+                // Create trigger function to capture production hash on first write
+                let create_func = format!(
+                    r#"
+                    CREATE OR REPLACE FUNCTION {}()
+                    RETURNS TRIGGER AS $$
+                    BEGIN
+                        INSERT INTO {}._mlb_row_hashes (table_name, pk_value, hash)
+                        SELECT '{table_name}', NEW.{pk}::TEXT, MD5(CONCAT_WS('|', {hash_cols}))
+                        FROM {source_schema}.{table_name} p
+                        WHERE p.{pk} = NEW.{pk}
+                        ON CONFLICT (table_name, pk_value) DO NOTHING;
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql
+                    "#,
+                    func_name,
+                    quote_ident(session_schema),
+                    table_name = table_name,
+                    pk = quote_ident(&pk_col),
+                    hash_cols = hash_cols,
+                    source_schema = quote_ident(source_schema),
+                );
+
+                if let Err(e) = client.execute(&create_func, &[]).await {
+                    warn!(error = %e, "Failed to create hash capture function");
+                } else {
+                    // Create trigger
+                    let trigger_name = format!("trg_capture_hash_{}", safe_ident(table_name));
+                    let create_trigger = format!(
+                        r#"
+                        CREATE TRIGGER {}
+                        BEFORE INSERT OR UPDATE ON {}
+                        FOR EACH ROW EXECUTE FUNCTION {}()
+                        "#,
+                        quote_ident(&trigger_name),
+                        shadow_table,
+                        func_name,
+                    );
+
+                    if let Err(e) = client.execute(&create_trigger, &[]).await {
+                        warn!(error = %e, "Failed to create hash capture trigger");
+                    } else {
+                        debug!(
+                            table = table_name,
+                            "Created hash capture trigger for conflict detection"
+                        );
+                    }
+                }
             }
         }
 
@@ -647,6 +745,14 @@ impl SchemaManager {
 
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Create a safe identifier for function/trigger names (alphanumeric + underscore only)
+fn safe_ident(ident: &str) -> String {
+    ident
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
 }
 
 /// Validate that a data type string from pg_catalog is safe to use in SQL.
