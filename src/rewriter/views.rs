@@ -29,9 +29,24 @@ pub enum ViewError {
 
     #[error("No primary key found for table: {0}.{1}")]
     NoPrimaryKey(String, String),
+
+    #[error("Identifier '{0}' is {1} bytes, exceeds PostgreSQL limit of 63 bytes")]
+    IdentifierTooLong(String, usize),
 }
 
 pub type ViewResult<T> = Result<T, ViewError>;
+
+/// PostgreSQL maximum identifier length in bytes.
+const PG_MAX_IDENTIFIER_LENGTH: usize = 63;
+
+/// Validates that an identifier doesn't exceed PostgreSQL's 63-byte limit.
+fn validate_identifier(ident: &str) -> ViewResult<()> {
+    let len = ident.len();
+    if len > PG_MAX_IDENTIFIER_LENGTH {
+        return Err(ViewError::IdentifierTooLong(ident.to_string(), len));
+    }
+    Ok(())
+}
 
 /// Quote a SQL identifier to prevent injection.
 ///
@@ -96,6 +111,21 @@ pub fn generate_union_view_sql(
         ));
     }
 
+    // Validate identifier lengths
+    validate_identifier(session_schema)?;
+    validate_identifier(source_schema)?;
+    validate_identifier(table_name)?;
+    let shadow_name = format!("_shadow_{}", table_name);
+    validate_identifier(&shadow_name)?;
+    let deleted_name = format!("_deleted_{}", table_name);
+    validate_identifier(&deleted_name)?;
+    for col in columns {
+        validate_identifier(col)?;
+    }
+    for pk in pk_columns {
+        validate_identifier(pk)?;
+    }
+
     let quoted_session_schema = quote_ident(session_schema);
     let quoted_source_schema = quote_ident(source_schema);
     let quoted_table = quote_ident(table_name);
@@ -135,16 +165,14 @@ WHERE {pk_not_in_shadow}
 ///
 /// # Panics
 ///
-/// This is an internal helper that assumes pk_columns is non-empty.
-/// Public functions must validate pk_columns before calling this.
+/// Panics if pk_columns is empty. Public functions must validate pk_columns
+/// before calling this helper - empty pk_columns is a programming error that
+/// must be caught at the API boundary, not silently handled here.
 fn generate_pk_not_in_clause(pk_columns: &[String], schema: &str, table: &str) -> String {
-    debug_assert!(!pk_columns.is_empty(), "pk_columns must be validated by caller");
-
-    if pk_columns.is_empty() {
-        // Defensive fallback - return a condition that's always true
-        // This should never happen if callers validate properly
-        return "TRUE".to_string();
-    }
+    assert!(
+        !pk_columns.is_empty(),
+        "BUG: pk_columns must be validated by caller before calling generate_pk_not_in_clause"
+    );
 
     if pk_columns.len() == 1 {
         // Simple case: single column PK
@@ -702,5 +730,83 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ViewError::NoColumnsFound(_, _)));
+    }
+
+    #[test]
+    fn test_identifier_too_long_returns_error() {
+        let long_name = "a".repeat(64); // 64 bytes exceeds 63-byte limit
+        let columns = vec!["id".to_string()];
+        let pk_columns = vec!["id".to_string()];
+
+        let result = generate_union_view_sql(
+            "session",
+            "public",
+            &long_name,
+            &pk_columns,
+            &columns,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ViewError::IdentifierTooLong(_, 64)));
+    }
+
+    #[test]
+    fn test_long_schema_returns_error() {
+        let long_schema = "s".repeat(64);
+        let columns = vec!["id".to_string()];
+        let pk_columns = vec!["id".to_string()];
+
+        let result = generate_union_view_sql(
+            &long_schema,
+            "public",
+            "users",
+            &pk_columns,
+            &columns,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ViewError::IdentifierTooLong(_, 64)));
+    }
+
+    #[test]
+    fn test_derived_identifier_too_long_returns_error() {
+        // Table name that's valid alone but _shadow_ prefix (8 chars) pushes it over
+        let table_name = "t".repeat(56); // 56 + 8 = 64 bytes
+        let columns = vec!["id".to_string()];
+        let pk_columns = vec!["id".to_string()];
+
+        let result = generate_union_view_sql(
+            "session",
+            "public",
+            &table_name,
+            &pk_columns,
+            &columns,
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ViewError::IdentifierTooLong(ident, _) => {
+                assert!(ident.starts_with("_shadow_") || ident.starts_with("_deleted_"));
+            }
+            e => panic!("Expected IdentifierTooLong, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_max_valid_identifier_succeeds() {
+        // Table name allowing for _deleted_ prefix (9 chars) within 63-byte limit
+        let table_name = "t".repeat(54); // 54 + 9 = 63 bytes, exactly at limit
+        let columns = vec!["id".to_string()];
+        let pk_columns = vec!["id".to_string()];
+
+        let result = generate_union_view_sql(
+            "s",
+            "public",
+            &table_name,
+            &pk_columns,
+            &columns,
+        );
+
+        assert!(result.is_ok());
     }
 }

@@ -51,6 +51,9 @@ pub async fn apply_session(
                 // This shouldn't happen since check_conflicts returns Ok with conflicts
                 ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
             }
+            ConflictError::InvalidDataType(msg) => {
+                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+            }
         })?;
 
     if !conflicts.is_empty() && !force {
