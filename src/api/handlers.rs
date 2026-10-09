@@ -351,33 +351,46 @@ async fn apply_shadow_to_production(
     session: &Session,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut total_applied = 0;
+    let schema = session.schema_name.clone();
 
-    for (table_name, table_state) in &session.tables {
-        if !table_state.shadow_created {
-            continue;
-        }
-
-        let pk = &table_state.primary_key;
-        let schema = &session.schema_name;
-
-        // Apply INSERTs (rows in shadow not in prod)
-        let insert_sql = format!(
+    // Query actual shadow tables from the schema (more reliable than cached session.tables)
+    let shadow_tables: Vec<(String, String)> = client
+        .query(
             r#"
-            INSERT INTO public."{table}"
-            SELECT s.* FROM "{schema}"."{table}" s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
-            )
+            SELECT
+                REPLACE(table_name, '_shadow_', '') as base_table,
+                table_name as shadow_table
+            FROM information_schema.tables
+            WHERE table_schema = $1
+              AND table_name LIKE '_shadow_%'
             "#,
-            schema = schema,
-            table = table_name,
-            pk = pk,
-        );
-        let inserted = client.execute(&insert_sql, &[]).await?;
-        total_applied += inserted as usize;
+            &[&schema],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get("base_table"), r.get("shadow_table")))
+        .collect();
 
-        // Apply UPDATEs (rows in both shadow and prod)
-        // Get columns for update
+    for (table_name, shadow_table) in shadow_tables {
+        // Get primary key for this table (same approach as conflict checker)
+        let pk: String = client
+            .query_one(
+                r#"
+                SELECT a.attname
+                FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                JOIN pg_class c ON c.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE i.indisprimary
+                  AND n.nspname = 'public'
+                  AND c.relname = $1
+                "#,
+                &[&table_name],
+            )
+            .await?
+            .get("attname");
+
+        // Get columns from production table (shadow has extra _mlb_* columns)
         let columns: Vec<String> = client
             .query(
                 r#"
@@ -385,18 +398,40 @@ async fn apply_shadow_to_production(
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND table_name = $1
-                  AND column_name != $2
                 ORDER BY ordinal_position
                 "#,
-                &[&table_name, &pk],
+                &[&table_name],
             )
             .await?
             .iter()
             .map(|r| r.get("column_name"))
             .collect();
 
-        if !columns.is_empty() {
-            let set_clause = columns
+        let col_list = columns.iter().map(|c| format!(r#""{}""#, c)).collect::<Vec<_>>().join(", ");
+
+        // Apply INSERTs (rows in shadow not in prod)
+        let insert_sql = format!(
+            r#"
+            INSERT INTO public."{table}" ({col_list})
+            SELECT {col_list} FROM "{schema}"."{shadow_table}" s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+            )
+            "#,
+            schema = schema,
+            table = table_name,
+            shadow_table = shadow_table,
+            pk = pk,
+            col_list = col_list,
+        );
+        let inserted = client.execute(&insert_sql, &[]).await?;
+        total_applied += inserted as usize;
+
+        // Apply UPDATEs (rows in both shadow and prod)
+        let non_pk_columns: Vec<&String> = columns.iter().filter(|c| c.as_str() != pk).collect();
+
+        if !non_pk_columns.is_empty() {
+            let set_clause = non_pk_columns
                 .iter()
                 .map(|col| format!(r#""{col}" = s."{col}""#))
                 .collect::<Vec<_>>()
@@ -406,11 +441,12 @@ async fn apply_shadow_to_production(
                 r#"
                 UPDATE public."{table}" p
                 SET {set_clause}
-                FROM "{schema}"."{table}" s
+                FROM "{schema}"."{shadow_table}" s
                 WHERE p."{pk}" = s."{pk}"
                 "#,
                 schema = schema,
                 table = table_name,
+                shadow_table = shadow_table,
                 pk = pk,
                 set_clause = set_clause,
             );
@@ -418,20 +454,22 @@ async fn apply_shadow_to_production(
             total_applied += updated as usize;
         }
 
-        // Apply DELETEs (check _mlb_deletes table if it exists)
+        // Apply DELETEs (check _deleted_{table} table)
+        let deleted_table = format!("_deleted_{}", table_name);
         let delete_sql = format!(
             r#"
             DELETE FROM public."{table}"
             WHERE "{pk}"::text IN (
-                SELECT pk_value FROM "{schema}"._mlb_deletes WHERE table_name = $1
+                SELECT pk_value FROM "{schema}"."{deleted_table}"
             )
             "#,
             schema = schema,
             table = table_name,
+            deleted_table = deleted_table,
             pk = pk,
         );
-        // Ignore error if _mlb_deletes doesn't exist
-        if let Ok(deleted) = client.execute(&delete_sql, &[&table_name]).await {
+        // Ignore error if deleted table doesn't exist
+        if let Ok(deleted) = client.execute(&delete_sql, &[]).await {
             total_applied += deleted as usize;
         }
     }
