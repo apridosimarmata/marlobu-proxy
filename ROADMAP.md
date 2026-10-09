@@ -44,18 +44,20 @@
 
 ---
 
-## Phase 3: SQL Completeness (v0.4)
+## Phase 3: SQL Completeness (v0.4) 🚧
 *Handle real-world queries*
 
-- [ ] **pg_query integration** — Replace sqlparser for full Postgres syntax
-- [ ] **JOIN rewriting** — Multi-table queries across session/prod boundaries
-- [ ] **Subqueries & CTEs** — Recursive, lateral, window functions
-- [ ] **RETURNING clause** — Capture returned data from writes
-- [ ] **ON CONFLICT** — Upsert semantics in shadow tables
-- [ ] **Prepared statements** — Extended query protocol fully supported
-- [ ] **Transactions** — BEGIN/COMMIT/ROLLBACK within session
+- [x] **JOIN rewriting** — Multi-table queries across session/prod boundaries (PR #11)
+- [x] **Subqueries & CTEs** — Recursive, lateral, window functions (PR #11)
+- [x] **RETURNING clause** — Capture returned data from writes (PR #11)
+- [x] **ON CONFLICT** — Upsert semantics in shadow tables (PR #11)
+- [x] **Prepared statements** — Extended query protocol fully supported (PR #11)
+- [x] **Transactions** — BEGIN/COMMIT/ROLLBACK within session (PR #11)
+- [ ] **pg_query integration** — Deferred; sqlparser handles all tested Postgres syntax
 
 **Exit criteria:** pgbench, Prisma, Drizzle queries all work.
+
+**Status:** Core SQL features complete. sqlparser 0.41 handles arrays, JSON operators, type casts, LATERAL, window functions, DISTINCT ON, FILTER, recursive CTEs, FOR UPDATE, and INTERVAL. Real-world ORM testing remains.
 
 ---
 
