@@ -483,7 +483,7 @@ impl Connection {
         for table_name in needs_view {
             self.ensure_view(&schema_name, &table_name).await?;
             // Mark after success - ensure_view creates shadow + deleted + view
-            let infra = self.ensured_tables.entry(table_name).or_default();
+            let infra = self.ensured_tables.entry(table_name.clone()).or_default();
             infra.view = true;
             infra.shadow = true;
             infra.deleted = true;
@@ -491,13 +491,13 @@ impl Connection {
 
         for table_name in needs_shadow {
             self.ensure_shadow(&schema_name, &table_name).await?;
-            let infra = self.ensured_tables.entry(table_name).or_default();
+            let infra = self.ensured_tables.entry(table_name.clone()).or_default();
             infra.shadow = true;
         }
 
         for table_name in needs_deleted {
             self.ensure_deleted(&schema_name, &table_name).await?;
-            let infra = self.ensured_tables.entry(table_name).or_default();
+            let infra = self.ensured_tables.entry(table_name.clone()).or_default();
             infra.deleted = true;
         }
 
