@@ -1039,3 +1039,78 @@ mod tests {
         assert!(sql.to_uppercase().contains("SERIALIZABLE"));
     }
 }
+
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+
+    fn test_parse(sql: &str) -> bool {
+        let r = Rewriter::new("test_schema");
+        r.rewrite(sql).is_ok()
+    }
+
+    #[test]
+    fn test_array_any() {
+        assert!(test_parse("SELECT * FROM users WHERE id = ANY(ARRAY[1,2,3])"));
+    }
+
+    #[test]
+    fn test_array_literal() {
+        assert!(test_parse("SELECT ARRAY[1,2,3]"));
+    }
+
+    #[test]
+    fn test_json_arrow() {
+        assert!(test_parse("SELECT data->>'name' FROM users"));
+    }
+
+    #[test]
+    fn test_json_arrow_single() {
+        assert!(test_parse("SELECT data->'nested' FROM users"));
+    }
+
+    #[test]
+    fn test_type_cast_double_colon() {
+        assert!(test_parse("SELECT '2024-01-01'::date"));
+    }
+
+    #[test]
+    fn test_lateral_join() {
+        assert!(test_parse("SELECT * FROM users u, LATERAL (SELECT * FROM orders WHERE user_id = u.id) o"));
+    }
+
+    #[test]
+    fn test_window_function() {
+        assert!(test_parse("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp"));
+    }
+
+    #[test]
+    fn test_distinct_on() {
+        assert!(test_parse("SELECT DISTINCT ON (dept) * FROM emp ORDER BY dept, salary DESC"));
+    }
+
+    #[test]
+    fn test_filter_clause() {
+        assert!(test_parse("SELECT COUNT(*) FILTER (WHERE active) FROM users"));
+    }
+
+    #[test]
+    fn test_recursive_cte() {
+        assert!(test_parse("WITH RECURSIVE cte AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM cte WHERE n < 10) SELECT * FROM cte"));
+    }
+
+    #[test]
+    fn test_for_update() {
+        assert!(test_parse("SELECT * FROM users WHERE id = 1 FOR UPDATE"));
+    }
+
+    #[test]
+    fn test_interval() {
+        assert!(test_parse("SELECT NOW() + INTERVAL '1 day'"));
+    }
+
+    #[test]
+    fn test_excluded_in_upsert() {
+        assert!(test_parse("INSERT INTO t (a,b) VALUES (1,2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b"));
+    }
+}
