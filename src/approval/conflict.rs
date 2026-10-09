@@ -25,6 +25,55 @@ pub enum ConflictError {
 
     #[error("Conflicts detected")]
     ConflictsDetected(Vec<Conflict>),
+
+    #[error("Invalid data type: {0}")]
+    InvalidDataType(String),
+}
+
+/// Quote an identifier to prevent SQL injection
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Validate a PostgreSQL data type string to prevent SQL injection.
+/// Only allows characters that can appear in valid PostgreSQL type names.
+fn validate_pg_data_type(data_type: &str) -> Result<&str, ConflictError> {
+    let trimmed = data_type.trim();
+
+    // Reject empty or overly long type names
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err(ConflictError::InvalidDataType(data_type.to_string()));
+    }
+
+    // Reject single quotes which could be used for SQL injection
+    if trimmed.contains('\'') {
+        return Err(ConflictError::InvalidDataType(data_type.to_string()));
+    }
+
+    // Only allow characters that can appear in valid PostgreSQL type names:
+    // - alphanumeric, underscore (type names like int4, varchar)
+    // - space (e.g., "character varying", "timestamp with time zone")
+    // - parentheses and digits (e.g., "varchar(255)", "numeric(10,2)")
+    // - brackets (e.g., "integer[]")
+    // - comma (e.g., "numeric(10,2)")
+    // - dot (e.g., "pg_catalog.int4")
+    let is_valid = trimmed.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || c == '_'
+            || c == ' '
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
+            || c == ','
+            || c == '.'
+    });
+
+    if !is_valid {
+        return Err(ConflictError::InvalidDataType(data_type.to_string()));
+    }
+
+    Ok(trimmed)
 }
 
 /// Check for conflicts between expected state and current production state
@@ -51,10 +100,10 @@ pub async fn check_conflicts(
             LEFT JOIN public.{table} p ON p.{pk}::text = es.row_id
             WHERE es.table_name = $1
         "#,
-            schema = schema_name,
-            table = table.table_name,
-            pk = table.primary_key,
-            columns = table.hash_columns.join(", "),
+            schema = quote_ident(schema_name),
+            table = quote_ident(&table.table_name),
+            pk = quote_ident(&table.primary_key),
+            columns = table.hash_columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", "),
         ), &[&table.table_name]).await?;
 
         for row in rows {
@@ -91,6 +140,9 @@ pub async fn check_conflicts(
 
         // Check for insert collisions (if we have inserts)
         if table.check_insert_collisions {
+            // Validate pk_type to prevent SQL injection
+            let validated_pk_type = validate_pg_data_type(&table.primary_key_type)?;
+
             let collision_rows = client.query(&format!(r#"
                 SELECT s.{pk}::text as row_id
                 FROM {schema}.{table} s
@@ -100,10 +152,10 @@ pub async fn check_conflicts(
                     WHERE table_name = $1
                 )
             "#,
-                schema = schema_name,
-                table = table.table_name,
-                pk = table.primary_key,
-                pk_type = table.primary_key_type,
+                schema = quote_ident(schema_name),
+                table = quote_ident(&table.table_name),
+                pk = quote_ident(&table.primary_key),
+                pk_type = validated_pk_type,
             ), &[&table.table_name]).await?;
 
             for row in collision_rows {
@@ -147,17 +199,18 @@ pub async fn get_hash_columns(
     let columns: Vec<String> = rows.iter().map(|row| {
         let col: String = row.get("column_name");
         let dtype: String = row.get("data_type");
+        let quoted_col = quote_ident(&col);
 
         // Handle NULL values and type coercion for stable hashing
         match dtype.as_str() {
-            "jsonb" | "json" => format!("COALESCE({}::text, '\\x00')", col),
+            "jsonb" | "json" => format!("COALESCE({}::text, '\\x00')", quoted_col),
             "timestamp with time zone" | "timestamp without time zone" => {
-                format!("COALESCE(to_char({}, 'YYYY-MM-DD HH24:MI:SS.US'), '\\x00')", col)
+                format!("COALESCE(to_char({}, 'YYYY-MM-DD HH24:MI:SS.US'), '\\x00')", quoted_col)
             }
             "numeric" | "decimal" | "real" | "double precision" => {
-                format!("COALESCE({}::numeric::text, '\\x00')", col)
+                format!("COALESCE({}::numeric::text, '\\x00')", quoted_col)
             }
-            _ => format!("COALESCE({}::text, '\\x00')", col),
+            _ => format!("COALESCE({}::text, '\\x00')", quoted_col),
         }
     }).collect();
 
@@ -180,5 +233,36 @@ mod tests {
 
         let json = serde_json::to_string(&conflict).unwrap();
         assert!(json.contains("row_modified"));
+    }
+
+    #[test]
+    fn test_quote_ident_simple() {
+        assert_eq!(quote_ident("users"), "\"users\"");
+        assert_eq!(quote_ident("my_table"), "\"my_table\"");
+    }
+
+    #[test]
+    fn test_quote_ident_with_special_chars() {
+        assert_eq!(quote_ident("with space"), "\"with space\"");
+        assert_eq!(quote_ident("with\"quote"), "\"with\"\"quote\"");
+    }
+
+    #[test]
+    fn test_validate_pg_data_type_valid() {
+        assert!(validate_pg_data_type("integer").is_ok());
+        assert!(validate_pg_data_type("bigint").is_ok());
+        assert!(validate_pg_data_type("character varying(255)").is_ok());
+        assert!(validate_pg_data_type("numeric(10,2)").is_ok());
+        assert!(validate_pg_data_type("timestamp with time zone").is_ok());
+        assert!(validate_pg_data_type("integer[]").is_ok());
+        assert!(validate_pg_data_type("pg_catalog.int4").is_ok());
+    }
+
+    #[test]
+    fn test_validate_pg_data_type_invalid() {
+        // SQL injection attempts
+        assert!(validate_pg_data_type("integer; DROP TABLE users").is_err());
+        assert!(validate_pg_data_type("text' OR '1'='1").is_err());
+        assert!(validate_pg_data_type("").is_err());
     }
 }

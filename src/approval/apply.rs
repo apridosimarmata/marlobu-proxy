@@ -47,8 +47,12 @@ pub async fn apply_session(
     let conflicts = check_conflicts(client, schema_name, &conflict_checks).await
         .map_err(|e| match e {
             ConflictError::Database(e) => ApplyError::Database(e),
-            ConflictError::ConflictsDetected(c) => {
+            ConflictError::ConflictsDetected(_) => {
                 // This shouldn't happen since check_conflicts returns Ok with conflicts
+                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+            }
+            ConflictError::InvalidDataType(_) => {
+                // Invalid data type in primary_key_type - treat as database error
                 ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
             }
         })?;

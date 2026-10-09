@@ -417,12 +417,18 @@ fn is_connection_closed_error(e: &anyhow::Error) -> bool {
 }
 
 /// Extract a value from Postgres options string (e.g., "-c key=value -c other=x")
+/// Uses char_indices to ensure safe UTF-8 boundary handling.
 fn extract_option_value(options: &str, key: &str) -> Option<String> {
     let pattern = format!("-c {}=", key);
     if let Some(pos) = options.find(&pattern) {
         let start = pos + pattern.len();
         let rest = &options[start..];
-        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        // Use char_indices to find whitespace safely across UTF-8 boundaries
+        let end = rest
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
         Some(rest[..end].to_string())
     } else {
         None
@@ -430,12 +436,18 @@ fn extract_option_value(options: &str, key: &str) -> Option<String> {
 }
 
 /// Strip a key=value pair from Postgres options string
+/// Uses char_indices to ensure safe UTF-8 boundary handling.
 fn strip_option_value(options: &str, key: &str) -> String {
     let pattern = format!("-c {}=", key);
     if let Some(pos) = options.find(&pattern) {
         let before = &options[..pos];
         let rest = &options[pos + pattern.len()..];
-        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        // Use char_indices to find whitespace safely across UTF-8 boundaries
+        let end = rest
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
         let after = &rest[end..];
         format!("{}{}", before.trim(), after).trim().to_string()
     } else {
