@@ -1,9 +1,9 @@
 //! Per-connection state machine for Postgres wire protocol proxy.
 
 use bytes::BytesMut;
+use deadpool_postgres::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use deadpool_postgres::Pool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
@@ -13,7 +13,7 @@ use crate::proxy::protocol::{
     self, encode_backend_message, encode_error, encode_parse, encode_query, encode_startup,
     parse_backend_message, parse_frontend_message, BackendMessage, FrontendMessage, StartupMessage,
 };
-use crate::rewriter::{Rewriter, QueryType, QueryAnalysis};
+use crate::rewriter::{QueryAnalysis, QueryType, Rewriter};
 use crate::session::schema::SchemaManager;
 
 /// Connection state in the proxy lifecycle
@@ -157,12 +157,16 @@ impl Connection {
         self.startup_params = startup.parameters.clone();
 
         // Extract marlobu_session - check direct parameter first
-        let session_str = startup.parameters.get("marlobu_session").cloned()
+        let session_str = startup
+            .parameters
+            .get("marlobu_session")
+            .cloned()
             .or_else(|| {
                 // Check inside options parameter: "-c marlobu_session=uuid"
-                startup.parameters.get("options").and_then(|opts| {
-                    extract_option_value(opts, "marlobu_session")
-                })
+                startup
+                    .parameters
+                    .get("options")
+                    .and_then(|opts| extract_option_value(opts, "marlobu_session"))
             });
 
         if let Some(session_str) = session_str {
@@ -347,7 +351,11 @@ impl Connection {
                         let backend = self.backend.as_mut().unwrap();
                         backend.write_all(&encoded).await?;
                     }
-                    FrontendMessage::Parse { name, query, param_types } => {
+                    FrontendMessage::Parse {
+                        name,
+                        query,
+                        param_types,
+                    } => {
                         let rewritten = self.rewrite_query(&query).await;
                         debug!(original = %query, rewritten = %rewritten, "Parse");
                         let encoded = encode_parse(&name, &rewritten, &param_types);
@@ -355,20 +363,24 @@ impl Connection {
                         backend.write_all(&encoded).await?;
                     }
                     FrontendMessage::Bind(payload) => {
-                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'B', &payload).await?;
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'B', &payload)
+                            .await?;
                     }
                     FrontendMessage::Describe(payload) => {
-                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'D', &payload).await?;
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'D', &payload)
+                            .await?;
                     }
                     FrontendMessage::Execute(payload) => {
-                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'E', &payload).await?;
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), b'E', &payload)
+                            .await?;
                     }
                     FrontendMessage::Sync => {
                         let backend = self.backend.as_mut().unwrap();
                         backend.write_all(&[b'S', 0, 0, 0, 4]).await?;
                     }
                     FrontendMessage::Other { tag, payload } => {
-                        forward_raw_to_backend(self.backend.as_mut().unwrap(), tag, &payload).await?;
+                        forward_raw_to_backend(self.backend.as_mut().unwrap(), tag, &payload)
+                            .await?;
                     }
                     _ => {
                         warn!("Unexpected message in query phase: {:?}", msg);
@@ -444,11 +456,16 @@ impl Connection {
         }
 
         // Handle: RESET marlobu.session
-        if upper.starts_with("RESET MARLOBU.SESSION") || upper.starts_with("RESET MARLOBU_SESSION") {
+        if upper.starts_with("RESET MARLOBU.SESSION") || upper.starts_with("RESET MARLOBU_SESSION")
+        {
             let rest = trimmed[21..].trim(); // Skip "RESET marlobu.session"
             let remaining = if rest.starts_with(';') {
                 let after_semi = rest[1..].trim();
-                if after_semi.is_empty() { None } else { Some(after_semi.to_string()) }
+                if after_semi.is_empty() {
+                    None
+                } else {
+                    Some(after_semi.to_string())
+                }
             } else {
                 None
             };
@@ -550,7 +567,11 @@ impl Connection {
 
         for table_ref in &analysis.tables {
             let table_name = &table_ref.name;
-            let infra = self.ensured_tables.get(table_name).cloned().unwrap_or_default();
+            let infra = self
+                .ensured_tables
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default();
 
             match analysis.query_type {
                 QueryType::Select => {
@@ -612,7 +633,11 @@ impl Connection {
 
     /// Ensure shadow table exists for a table
     async fn ensure_shadow(&self, schema_name: &str, table_name: &str) -> anyhow::Result<()> {
-        debug!(schema = schema_name, table = table_name, "Ensuring shadow table");
+        debug!(
+            schema = schema_name,
+            table = table_name,
+            "Ensuring shadow table"
+        );
         self.schema_manager
             .create_shadow_table(schema_name, "public", table_name)
             .await?;
@@ -621,7 +646,11 @@ impl Connection {
 
     /// Ensure deleted tracking table exists for a table
     async fn ensure_deleted(&self, schema_name: &str, table_name: &str) -> anyhow::Result<()> {
-        debug!(schema = schema_name, table = table_name, "Ensuring deleted table");
+        debug!(
+            schema = schema_name,
+            table = table_name,
+            "Ensuring deleted table"
+        );
         self.schema_manager
             .create_deleted_table(schema_name, "public", table_name)
             .await?;
@@ -643,7 +672,8 @@ impl Connection {
             .await?;
 
         // Get primary key for view creation
-        let pk = self.schema_manager
+        let pk = self
+            .schema_manager
             .get_primary_key("public", table_name)
             .await?;
 
@@ -654,7 +684,8 @@ impl Connection {
 
         // Update session's tables state in database so approval can find it
         if let Some(session_id) = self.session_id {
-            self.update_session_table_state(session_id, table_name, &pk).await?;
+            self.update_session_table_state(session_id, table_name, &pk)
+                .await?;
         }
 
         Ok(())
@@ -702,7 +733,11 @@ impl Connection {
 }
 
 /// Forward a raw message to backend (free function to avoid borrow issues)
-async fn forward_raw_to_backend(backend: &mut TcpStream, tag: u8, payload: &[u8]) -> anyhow::Result<()> {
+async fn forward_raw_to_backend(
+    backend: &mut TcpStream,
+    tag: u8,
+    payload: &[u8],
+) -> anyhow::Result<()> {
     use bytes::BufMut;
     let mut msg = BytesMut::new();
     msg.put_u8(tag);
@@ -772,7 +807,10 @@ mod tests {
     #[test]
     fn test_extract_option_value() {
         let opts = "-c marlobu_session=abc-123 -c other=xyz";
-        assert_eq!(extract_option_value(opts, "marlobu_session"), Some("abc-123".to_string()));
+        assert_eq!(
+            extract_option_value(opts, "marlobu_session"),
+            Some("abc-123".to_string())
+        );
         assert_eq!(extract_option_value(opts, "other"), Some("xyz".to_string()));
         assert_eq!(extract_option_value(opts, "missing"), None);
     }
@@ -797,7 +835,9 @@ mod tests {
         assert!(sql.contains("session_abc123._view_users"));
 
         // INSERT should use shadow table
-        let (sql, qt) = rewriter.rewrite("INSERT INTO users (name) VALUES ('test')").unwrap();
+        let (sql, qt) = rewriter
+            .rewrite("INSERT INTO users (name) VALUES ('test')")
+            .unwrap();
         assert_eq!(qt, QueryType::Insert);
         assert!(sql.contains("session_abc123._view_users"));
     }

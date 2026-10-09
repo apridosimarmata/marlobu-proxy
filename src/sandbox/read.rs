@@ -27,15 +27,17 @@ pub async fn ensure_read_view(
     primary_key: &str,
 ) -> Result<(), ReadError> {
     // Check if view already exists
-    let exists = client.query_one(
-        r#"
+    let exists = client
+        .query_one(
+            r#"
         SELECT EXISTS(
             SELECT 1 FROM information_schema.views
             WHERE table_schema = $1 AND table_name = $2
         )
         "#,
-        &[&schema_name, &format!("{}_view", table_name)],
-    ).await?;
+            &[&schema_name, &format!("{}_view", table_name)],
+        )
+        .await?;
 
     let view_exists: bool = exists.get(0);
     if view_exists {
@@ -43,21 +45,26 @@ pub async fn ensure_read_view(
     }
 
     // Check if shadow table exists
-    let shadow_exists = client.query_one(
-        r#"
+    let shadow_exists = client
+        .query_one(
+            r#"
         SELECT EXISTS(
             SELECT 1 FROM information_schema.tables
             WHERE table_schema = $1 AND table_name = $2
         )
         "#,
-        &[&schema_name, &table_name],
-    ).await?;
+            &[&schema_name, &table_name],
+        )
+        .await?;
 
     let has_shadow: bool = shadow_exists.get(0);
 
     if has_shadow {
         // Create view with shadow + prod merge
-        client.execute(&format!(r#"
+        client
+            .execute(
+                &format!(
+                    r#"
             CREATE OR REPLACE VIEW {schema}.{table}_view AS
             SELECT * FROM {schema}.{table}
             UNION ALL
@@ -67,23 +74,32 @@ pub async fn ensure_read_view(
                   SELECT row_id FROM {schema}._deletes WHERE table_name = '{table}'
               )
         "#,
-            schema = schema_name,
-            table = table_name,
-            pk = primary_key,
-        ), &[]).await?;
+                    schema = schema_name,
+                    table = table_name,
+                    pk = primary_key,
+                ),
+                &[],
+            )
+            .await?;
     } else {
         // No shadow yet - view just points to prod minus deletes
-        client.execute(&format!(r#"
+        client
+            .execute(
+                &format!(
+                    r#"
             CREATE OR REPLACE VIEW {schema}.{table}_view AS
             SELECT p.* FROM public.{table} p
             WHERE p.{pk}::text NOT IN (
                 SELECT row_id FROM {schema}._deletes WHERE table_name = '{table}'
             )
         "#,
-            schema = schema_name,
-            table = table_name,
-            pk = primary_key,
-        ), &[]).await?;
+                    schema = schema_name,
+                    table = table_name,
+                    pk = primary_key,
+                ),
+                &[],
+            )
+            .await?;
     }
 
     Ok(())
@@ -94,16 +110,18 @@ pub async fn get_primary_key(
     client: &tokio_postgres::Client,
     table_name: &str,
 ) -> Result<String, ReadError> {
-    let row = client.query_opt(
-        r#"
+    let row = client
+        .query_opt(
+            r#"
         SELECT a.attname
         FROM pg_index i
         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
         WHERE i.indrelid = $1::regclass AND i.indisprimary
         LIMIT 1
         "#,
-        &[&format!("public.{}", table_name)],
-    ).await?;
+            &[&format!("public.{}", table_name)],
+        )
+        .await?;
 
     row.map(|r| r.get("attname"))
         .ok_or_else(|| ReadError::NoPrimaryKeyFound(table_name.to_string()))

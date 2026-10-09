@@ -198,14 +198,9 @@ pub async fn validate_fk_constraints(
     for fk in &fks {
         // Check 1: INSERTs/UPDATEs in source table - do referenced rows exist?
         if shadow_tables.contains(&fk.source_table) {
-            let insert_violations = check_missing_references(
-                client,
-                session_schema,
-                source_schema,
-                fk,
-                &shadow_tables,
-            )
-            .await?;
+            let insert_violations =
+                check_missing_references(client, session_schema, source_schema, fk, &shadow_tables)
+                    .await?;
             violations.extend(insert_violations);
         }
 
@@ -224,7 +219,10 @@ pub async fn validate_fk_constraints(
     }
 
     if !violations.is_empty() {
-        warn!(count = violations.len(), "FK constraint violations detected");
+        warn!(
+            count = violations.len(),
+            "FK constraint violations detected"
+        );
     }
 
     Ok(violations)

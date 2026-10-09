@@ -100,7 +100,9 @@ pub enum BackendMessage {
 /// Returns Ok(Some(msg)) if complete message parsed.
 /// Returns Ok(None) if more data needed.
 /// Returns Err on invalid data.
-pub fn parse_frontend_message(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, ProtocolError> {
+pub fn parse_frontend_message(
+    buf: &mut BytesMut,
+) -> Result<Option<FrontendMessage>, ProtocolError> {
     if buf.len() < 4 {
         return Ok(None);
     }
@@ -120,7 +122,9 @@ pub fn parse_frontend_message(buf: &mut BytesMut) -> Result<Option<FrontendMessa
 
     let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
     if len < 4 {
-        return Err(ProtocolError::InvalidFormat("Message length too small".into()));
+        return Err(ProtocolError::InvalidFormat(
+            "Message length too small".into(),
+        ));
     }
 
     let total_len = 1 + len; // type byte + length field value (includes length itself)
@@ -203,7 +207,9 @@ fn is_startup_message(buf: &BytesMut) -> Result<bool, ProtocolError> {
     Ok(false)
 }
 
-fn parse_startup_phase_message(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, ProtocolError> {
+fn parse_startup_phase_message(
+    buf: &mut BytesMut,
+) -> Result<Option<FrontendMessage>, ProtocolError> {
     if buf.len() < 8 {
         return Ok(None);
     }
@@ -257,7 +263,9 @@ pub fn parse_backend_message(buf: &mut BytesMut) -> Result<Option<BackendMessage
     let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
 
     if len < 4 {
-        return Err(ProtocolError::InvalidFormat("Message length too small".into()));
+        return Err(ProtocolError::InvalidFormat(
+            "Message length too small".into(),
+        ));
     }
 
     let total_len = 1 + len;
@@ -493,8 +501,14 @@ mod tests {
 
         let msg = parse_frontend_message(&mut buf).unwrap().unwrap();
         if let FrontendMessage::Startup(startup) = msg {
-            assert_eq!(startup.parameters.get("user"), Some(&"postgres".to_string()));
-            assert_eq!(startup.parameters.get("database"), Some(&"test".to_string()));
+            assert_eq!(
+                startup.parameters.get("user"),
+                Some(&"postgres".to_string())
+            );
+            assert_eq!(
+                startup.parameters.get("database"),
+                Some(&"test".to_string())
+            );
         } else {
             panic!("Expected Startup message");
         }

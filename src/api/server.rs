@@ -5,6 +5,7 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
@@ -18,7 +19,10 @@ use super::handlers::{
 
 /// Build the API router with all routes
 pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
-    let state = AppState { session_manager, source_schema: "public".to_string() };
+    let state = AppState {
+        session_manager,
+        source_schema: "public".to_string(),
+    };
 
     Router::new()
         // Session CRUD
@@ -41,15 +45,36 @@ pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
 }
 
 /// Start the HTTP API server
-pub async fn start_server(config: &Config, session_manager: Arc<SessionManager>) -> Result<()> {
+pub async fn start_server(
+    config: &Config,
+    session_manager: Arc<SessionManager>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
     let app = build_router(session_manager);
 
     let listener = TcpListener::bind(&config.api_addr).await?;
     info!("API server listening on {}", config.api_addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await?;
 
+    info!("API server stopped");
     Ok(())
+}
+
+/// Wait for shutdown signal
+async fn shutdown_signal(mut rx: watch::Receiver<bool>) {
+    // Use borrow_and_update to avoid race conditions
+    // Exit on error (sender dropped) or when shutdown signaled
+    loop {
+        if rx.changed().await.is_err() {
+            break;
+        }
+        if *rx.borrow_and_update() {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]

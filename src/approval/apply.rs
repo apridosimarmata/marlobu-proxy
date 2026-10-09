@@ -42,18 +42,20 @@ pub async fn apply_session(
     force: bool,
 ) -> Result<ApplyResult, ApplyError> {
     // 1. Build conflict check configs
-    let conflict_checks: Vec<TableConflictCheck> = tables.iter().map(|t| {
-        TableConflictCheck {
+    let conflict_checks: Vec<TableConflictCheck> = tables
+        .iter()
+        .map(|t| TableConflictCheck {
             table_name: t.table_name.clone(),
             primary_key: t.primary_key.clone(),
             primary_key_type: t.primary_key_type.clone(),
             hash_columns: t.hash_columns.clone(),
             check_insert_collisions: t.has_inserts,
-        }
-    }).collect();
+        })
+        .collect();
 
     // 2. Check conflicts
-    let conflicts = check_conflicts(client, schema_name, &conflict_checks).await
+    let conflicts = check_conflicts(client, schema_name, &conflict_checks)
+        .await
         .map_err(|e| match e {
             ConflictError::Database(e) => ApplyError::Database(e),
             ConflictError::ConflictsDetected(_) => {
@@ -88,51 +90,71 @@ async fn apply_table(
     let mut count = 0;
 
     // Apply INSERTs (rows in shadow not in prod)
-    let insert_result = tx.execute(&format!(r#"
+    let insert_result = tx
+        .execute(
+            &format!(
+                r#"
         INSERT INTO public.{table}
         SELECT s.* FROM {schema}.{table} s
         WHERE s.{pk} NOT IN (SELECT {pk} FROM public.{table})
     "#,
-        schema = schema_name,
-        table = table.table_name,
-        pk = table.primary_key,
-    ), &[]).await?;
+                schema = schema_name,
+                table = table.table_name,
+                pk = table.primary_key,
+            ),
+            &[],
+        )
+        .await?;
     count += insert_result as usize;
 
     // Apply UPDATEs (rows in both shadow and prod)
     // We need to update all columns except the primary key
     if !table.update_columns.is_empty() {
-        let set_clause = table.update_columns.iter()
+        let set_clause = table
+            .update_columns
+            .iter()
             .map(|col| format!("{col} = s.{col}"))
             .collect::<Vec<_>>()
             .join(", ");
 
-        let update_result = tx.execute(&format!(r#"
+        let update_result = tx
+            .execute(
+                &format!(
+                    r#"
             UPDATE public.{table} p
             SET {set_clause}
             FROM {schema}.{table} s
             WHERE p.{pk} = s.{pk}
               AND p.{pk} IN (SELECT {pk} FROM public.{table})
         "#,
-            schema = schema_name,
-            table = table.table_name,
-            pk = table.primary_key,
-            set_clause = set_clause,
-        ), &[]).await?;
+                    schema = schema_name,
+                    table = table.table_name,
+                    pk = table.primary_key,
+                    set_clause = set_clause,
+                ),
+                &[],
+            )
+            .await?;
         count += update_result as usize;
     }
 
     // Apply DELETEs
-    let delete_result = tx.execute(&format!(r#"
+    let delete_result = tx
+        .execute(
+            &format!(
+                r#"
         DELETE FROM public.{table}
         WHERE {pk}::text IN (
             SELECT row_id FROM {schema}._deletes WHERE table_name = $1
         )
     "#,
-        schema = schema_name,
-        table = table.table_name,
-        pk = table.primary_key,
-    ), &[&table.table_name]).await?;
+                schema = schema_name,
+                table = table.table_name,
+                pk = table.primary_key,
+            ),
+            &[&table.table_name],
+        )
+        .await?;
     count += delete_result as usize;
 
     Ok(count)
@@ -154,14 +176,19 @@ pub async fn get_update_columns(
     table_name: &str,
     primary_key: &str,
 ) -> Result<Vec<String>, tokio_postgres::Error> {
-    let rows = client.query(r#"
+    let rows = client
+        .query(
+            r#"
         SELECT column_name
         FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = $1
           AND column_name != $2
         ORDER BY ordinal_position
-    "#, &[&table_name, &primary_key]).await?;
+    "#,
+            &[&table_name, &primary_key],
+        )
+        .await?;
 
     Ok(rows.iter().map(|r| r.get("column_name")).collect())
 }
