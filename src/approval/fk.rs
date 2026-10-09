@@ -1,0 +1,477 @@
+//! Foreign key constraint validation at approval time.
+//!
+//! Validates that shadow table changes won't violate FK constraints when applied to production.
+
+use serde::Serialize;
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+#[derive(Error, Debug)]
+pub enum FkError {
+    #[error("Database error: {0}")]
+    Database(#[from] tokio_postgres::Error),
+
+    #[error("Pool error: {0}")]
+    Pool(#[from] deadpool_postgres::PoolError),
+}
+
+/// A foreign key constraint definition
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    pub constraint_name: String,
+    pub source_table: String,
+    pub source_columns: Vec<String>,
+    pub target_table: String,
+    pub target_columns: Vec<String>,
+    pub on_delete: String,
+    pub on_update: String,
+}
+
+/// A foreign key violation detected during validation
+#[derive(Debug, Clone, Serialize)]
+pub struct FkViolation {
+    pub constraint_name: String,
+    pub violation_type: FkViolationType,
+    pub source_table: String,
+    pub target_table: String,
+    pub violating_values: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FkViolationType {
+    /// INSERT/UPDATE references a non-existent row
+    MissingReference,
+    /// DELETE would orphan rows in referencing table
+    WouldOrphan,
+}
+
+/// Get all foreign key constraints for tables in the given schema
+pub async fn get_foreign_keys(
+    client: &deadpool_postgres::Client,
+    schema: &str,
+    tables: &[String],
+) -> Result<Vec<ForeignKey>, FkError> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build IN clause with table names directly (safely escaped)
+    let table_list: String = tables
+        .iter()
+        .map(|t| format!("'{}'", t.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let query = format!(
+        r#"
+        SELECT
+            c.conname as constraint_name,
+            src.relname as source_table,
+            array_agg(DISTINCT src_attr.attname ORDER BY src_attr.attname) as source_columns,
+            tgt.relname as target_table,
+            array_agg(DISTINCT tgt_attr.attname ORDER BY tgt_attr.attname) as target_columns,
+            CASE c.confdeltype
+                WHEN 'a' THEN 'NO ACTION'
+                WHEN 'r' THEN 'RESTRICT'
+                WHEN 'c' THEN 'CASCADE'
+                WHEN 'n' THEN 'SET NULL'
+                WHEN 'd' THEN 'SET DEFAULT'
+            END as on_delete,
+            CASE c.confupdtype
+                WHEN 'a' THEN 'NO ACTION'
+                WHEN 'r' THEN 'RESTRICT'
+                WHEN 'c' THEN 'CASCADE'
+                WHEN 'n' THEN 'SET NULL'
+                WHEN 'd' THEN 'SET DEFAULT'
+            END as on_update
+        FROM pg_constraint c
+        JOIN pg_class src ON src.oid = c.conrelid
+        JOIN pg_namespace src_ns ON src_ns.oid = src.relnamespace
+        JOIN pg_class tgt ON tgt.oid = c.confrelid
+        JOIN pg_attribute src_attr ON src_attr.attrelid = c.conrelid
+            AND src_attr.attnum = ANY(c.conkey)
+        JOIN pg_attribute tgt_attr ON tgt_attr.attrelid = c.confrelid
+            AND tgt_attr.attnum = ANY(c.confkey)
+        WHERE c.contype = 'f'
+          AND src_ns.nspname = $1
+          AND (src.relname IN ({table_list}) OR tgt.relname IN ({table_list}))
+        GROUP BY c.conname, src.relname, tgt.relname, c.confdeltype, c.confupdtype
+        "#,
+        table_list = table_list
+    );
+
+    let rows = client.query(&query, &[&schema]).await?;
+
+    let mut fks = Vec::new();
+    for row in rows {
+        fks.push(ForeignKey {
+            constraint_name: row.get("constraint_name"),
+            source_table: row.get("source_table"),
+            source_columns: row.get("source_columns"),
+            target_table: row.get("target_table"),
+            target_columns: row.get("target_columns"),
+            on_delete: row.get("on_delete"),
+            on_update: row.get("on_update"),
+        });
+    }
+
+    debug!(count = fks.len(), "Found foreign key constraints");
+    Ok(fks)
+}
+
+/// Validate FK constraints for session changes
+pub async fn validate_fk_constraints(
+    client: &deadpool_postgres::Client,
+    session_schema: &str,
+    source_schema: &str,
+) -> Result<Vec<FkViolation>, FkError> {
+    let mut violations = Vec::new();
+
+    // Get list of shadow tables (tables with changes)
+    let shadow_tables: Vec<String> = client
+        .query(
+            r#"
+            SELECT SUBSTRING(table_name FROM 9) as base_table
+            FROM information_schema.tables
+            WHERE table_schema = $1
+              AND table_name LIKE '_shadow_%'
+            "#,
+            &[&session_schema],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get("base_table"))
+        .collect();
+
+    if shadow_tables.is_empty() {
+        debug!("No shadow tables found, skipping FK validation");
+        return Ok(violations);
+    }
+
+    info!(tables = ?shadow_tables, "Validating FK constraints for shadow tables");
+
+    // Get FK constraints involving these tables
+    let fks = get_foreign_keys(client, source_schema, &shadow_tables).await?;
+
+    for fk in &fks {
+        // Check 1: INSERTs/UPDATEs in source table - do referenced rows exist?
+        if shadow_tables.contains(&fk.source_table) {
+            let insert_violations = check_missing_references(
+                client,
+                session_schema,
+                source_schema,
+                fk,
+                &shadow_tables,
+            )
+            .await?;
+            violations.extend(insert_violations);
+        }
+
+        // Check 2: DELETEs in target table - would any rows be orphaned?
+        if shadow_tables.contains(&fk.target_table) {
+            let delete_violations = check_orphaned_references(
+                client,
+                session_schema,
+                source_schema,
+                fk,
+                &shadow_tables,
+            )
+            .await?;
+            violations.extend(delete_violations);
+        }
+    }
+
+    if !violations.is_empty() {
+        warn!(count = violations.len(), "FK constraint violations detected");
+    }
+
+    Ok(violations)
+}
+
+/// Check if INSERTs/UPDATEs in shadow table reference non-existent rows
+async fn check_missing_references(
+    client: &deadpool_postgres::Client,
+    session_schema: &str,
+    source_schema: &str,
+    fk: &ForeignKey,
+    shadow_tables: &[String],
+) -> Result<Vec<FkViolation>, FkError> {
+    let mut violations = Vec::new();
+
+    // Build column references for the join condition
+    let src_cols: Vec<String> = fk
+        .source_columns
+        .iter()
+        .map(|c| format!(r#"s."{}""#, c))
+        .collect();
+    let tgt_cols: Vec<String> = fk
+        .target_columns
+        .iter()
+        .map(|c| format!(r#"t."{}""#, c))
+        .collect();
+
+    let join_conditions: Vec<String> = src_cols
+        .iter()
+        .zip(tgt_cols.iter())
+        .map(|(s, t)| format!("{} = {}", s, t))
+        .collect();
+
+    // Check if target table also has shadow changes
+    let target_has_shadow = shadow_tables.contains(&fk.target_table);
+
+    // Query: Find rows in shadow source table where FK columns don't exist in target
+    // Must check both production AND shadow (if target has changes)
+    let query = if target_has_shadow {
+        format!(
+            r#"
+            SELECT DISTINCT {src_cols_select}
+            FROM "{session_schema}"."_shadow_{source_table}" s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{source_schema}"."{target_table}" t
+                WHERE {join_cond}
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM "{session_schema}"."_shadow_{target_table}" t
+                WHERE {join_cond}
+            )
+            AND ({not_null_check})
+            LIMIT 10
+            "#,
+            src_cols_select = src_cols.join(", "),
+            session_schema = session_schema,
+            source_schema = source_schema,
+            source_table = fk.source_table,
+            target_table = fk.target_table,
+            join_cond = join_conditions.join(" AND "),
+            not_null_check = src_cols
+                .iter()
+                .map(|c| format!("{} IS NOT NULL", c))
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        )
+    } else {
+        format!(
+            r#"
+            SELECT DISTINCT {src_cols_select}
+            FROM "{session_schema}"."_shadow_{source_table}" s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{source_schema}"."{target_table}" t
+                WHERE {join_cond}
+            )
+            AND ({not_null_check})
+            LIMIT 10
+            "#,
+            src_cols_select = src_cols.join(", "),
+            session_schema = session_schema,
+            source_schema = source_schema,
+            source_table = fk.source_table,
+            target_table = fk.target_table,
+            join_cond = join_conditions.join(" AND "),
+            not_null_check = src_cols
+                .iter()
+                .map(|c| format!("{} IS NOT NULL", c))
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        )
+    };
+
+    let rows = client.query(&query, &[]).await?;
+
+    if !rows.is_empty() {
+        let violating_values: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                fk.source_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| {
+                        let val: Option<String> = row.try_get(i).ok();
+                        format!("{}={}", col, val.unwrap_or_else(|| "NULL".to_string()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .collect();
+
+        violations.push(FkViolation {
+            constraint_name: fk.constraint_name.clone(),
+            violation_type: FkViolationType::MissingReference,
+            source_table: fk.source_table.clone(),
+            target_table: fk.target_table.clone(),
+            violating_values,
+            message: format!(
+                "INSERT/UPDATE in '{}' references non-existent rows in '{}'",
+                fk.source_table, fk.target_table
+            ),
+        });
+    }
+
+    Ok(violations)
+}
+
+/// Check if DELETEs in target table would orphan rows in referencing table
+async fn check_orphaned_references(
+    client: &deadpool_postgres::Client,
+    session_schema: &str,
+    source_schema: &str,
+    fk: &ForeignKey,
+    shadow_tables: &[String],
+) -> Result<Vec<FkViolation>, FkError> {
+    let mut violations = Vec::new();
+
+    // Skip if ON DELETE CASCADE or SET NULL (these are safe)
+    if fk.on_delete == "CASCADE" || fk.on_delete == "SET NULL" || fk.on_delete == "SET DEFAULT" {
+        debug!(
+            constraint = %fk.constraint_name,
+            on_delete = %fk.on_delete,
+            "Skipping orphan check due to ON DELETE action"
+        );
+        return Ok(violations);
+    }
+
+    // Check if there's a _deleted table for the target
+    let deleted_table_exists: bool = client
+        .query_one(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = $1 AND table_name = $2
+            ) as exists
+            "#,
+            &[&session_schema, &format!("_deleted_{}", fk.target_table)],
+        )
+        .await?
+        .get("exists");
+
+    if !deleted_table_exists {
+        return Ok(violations);
+    }
+
+    // Build join conditions
+    let src_cols: Vec<String> = fk
+        .source_columns
+        .iter()
+        .map(|c| format!(r#"src."{}""#, c))
+        .collect();
+    let del_cols: Vec<String> = fk
+        .target_columns
+        .iter()
+        .map(|c| format!(r#"del."{}""#, c))
+        .collect();
+
+    let join_conditions: Vec<String> = src_cols
+        .iter()
+        .zip(del_cols.iter())
+        .map(|(s, d)| format!("{} = {}", s, d))
+        .collect();
+
+    // Check if source table also has shadow changes (might have corresponding deletes)
+    let source_has_shadow = shadow_tables.contains(&fk.source_table);
+
+    // Find rows in source table that reference deleted target rows
+    let query = if source_has_shadow {
+        // If source also has changes, exclude rows being deleted from source
+        format!(
+            r#"
+            SELECT DISTINCT {src_cols_select}
+            FROM "{source_schema}"."{source_table}" src
+            JOIN "{session_schema}"."_deleted_{target_table}" del ON {join_cond}
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{session_schema}"."_deleted_{source_table}" src_del
+                WHERE {src_del_cond}
+            )
+            LIMIT 10
+            "#,
+            src_cols_select = fk.source_columns
+                .iter()
+                .map(|c| format!(r#"src."{}""#, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            source_schema = source_schema,
+            session_schema = session_schema,
+            source_table = fk.source_table,
+            target_table = fk.target_table,
+            join_cond = join_conditions.join(" AND "),
+            src_del_cond = fk.source_columns
+                .iter()
+                .map(|c| format!(r#"src."{c}" = src_del."{c}""#, c = c))
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        )
+    } else {
+        format!(
+            r#"
+            SELECT DISTINCT {src_cols_select}
+            FROM "{source_schema}"."{source_table}" src
+            JOIN "{session_schema}"."_deleted_{target_table}" del ON {join_cond}
+            LIMIT 10
+            "#,
+            src_cols_select = fk.source_columns
+                .iter()
+                .map(|c| format!(r#"src."{}""#, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            source_schema = source_schema,
+            session_schema = session_schema,
+            source_table = fk.source_table,
+            target_table = fk.target_table,
+            join_cond = join_conditions.join(" AND "),
+        )
+    };
+
+    let rows = client.query(&query, &[]).await?;
+
+    if !rows.is_empty() {
+        let violating_values: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                fk.source_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| {
+                        let val: Option<String> = row.try_get(i).ok();
+                        format!("{}={}", col, val.unwrap_or_else(|| "NULL".to_string()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .collect();
+
+        violations.push(FkViolation {
+            constraint_name: fk.constraint_name.clone(),
+            violation_type: FkViolationType::WouldOrphan,
+            source_table: fk.source_table.clone(),
+            target_table: fk.target_table.clone(),
+            violating_values,
+            message: format!(
+                "DELETE in '{}' would orphan rows in '{}' (constraint: {})",
+                fk.target_table, fk.source_table, fk.constraint_name
+            ),
+        });
+    }
+
+    Ok(violations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fk_violation_serialization() {
+        let violation = FkViolation {
+            constraint_name: "orders_user_id_fkey".to_string(),
+            violation_type: FkViolationType::MissingReference,
+            source_table: "orders".to_string(),
+            target_table: "users".to_string(),
+            violating_values: vec!["user_id=999".to_string()],
+            message: "INSERT in 'orders' references non-existent rows in 'users'".to_string(),
+        };
+
+        let json = serde_json::to_string(&violation).unwrap();
+        assert!(json.contains("missing_reference"));
+        assert!(json.contains("orders_user_id_fkey"));
+    }
+}

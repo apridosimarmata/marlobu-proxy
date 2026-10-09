@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::approval::conflict::{check_row_hash_conflicts, ConflictType};
 use crate::approval::diff::{generate_session_diff, SessionDiff};
+use crate::approval::fk::{validate_fk_constraints, FkViolation, FkViolationType};
 use crate::session::{get_session_mutations, Session, SessionManager, SessionStatus};
 
 // ============================================================================
@@ -76,6 +77,22 @@ pub struct ConflictDetail {
     pub conflict_type: String,
     pub captured_hash: String,
     pub current_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FkViolationResponse {
+    pub status: String,
+    pub violations: Vec<FkViolationDetail>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FkViolationDetail {
+    pub constraint_name: String,
+    pub violation_type: String,
+    pub source_table: String,
+    pub target_table: String,
+    pub violating_values: Vec<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -304,7 +321,53 @@ pub async fn approve_session(
         );
     }
 
-    // 5. No conflicts - apply changes from shadow to production
+    // 5. Check for FK constraint violations
+    let fk_violations = match validate_fk_constraints(&client, &session.schema_name, "public").await {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, session_id = %id, "Failed to check FK constraints");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ErrorResponse {
+                    error: format!("FK constraint check failed: {}", e),
+                }).unwrap()),
+            );
+        }
+    };
+
+    // 6. If FK violations exist, return them to client
+    if !fk_violations.is_empty() {
+        info!(
+            session_id = %id,
+            violation_count = fk_violations.len(),
+            "FK constraint violations detected, cannot approve"
+        );
+
+        let violation_details: Vec<FkViolationDetail> = fk_violations
+            .into_iter()
+            .map(|v| FkViolationDetail {
+                constraint_name: v.constraint_name,
+                violation_type: match v.violation_type {
+                    FkViolationType::MissingReference => "missing_reference".to_string(),
+                    FkViolationType::WouldOrphan => "would_orphan".to_string(),
+                },
+                source_table: v.source_table,
+                target_table: v.target_table,
+                violating_values: v.violating_values,
+                message: v.message,
+            })
+            .collect();
+
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::to_value(FkViolationResponse {
+                status: "fk_violations".to_string(),
+                violations: violation_details,
+            }).unwrap()),
+        );
+    }
+
+    // 7. No conflicts or FK violations - apply changes from shadow to production
     let applied = match apply_shadow_to_production(&client, &session).await {
         Ok(count) => count,
         Err(e) => {
