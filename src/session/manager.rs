@@ -372,21 +372,22 @@ impl SessionManager {
 
     /// Clean up expired sessions
     pub async fn cleanup_expired(&self) -> SessionResult<usize> {
-        let expired = self.store.list_expired().await?;
-        let count = expired.len();
+        let sessions = self.store.list_needing_cleanup().await?;
+        let count = sessions.len();
 
-        for session in expired {
+        for session in sessions {
             if let Err(e) = self.destroy(session.id).await {
                 warn!(
                     session_id = %session.id,
+                    status = session.status.as_str(),
                     error = %e,
-                    "Failed to cleanup expired session"
+                    "Failed to cleanup session"
                 );
             }
         }
 
         if count > 0 {
-            info!(count, "Cleaned up expired sessions");
+            info!(count, "Cleaned up sessions");
         }
 
         Ok(count)

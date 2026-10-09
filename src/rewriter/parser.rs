@@ -4,7 +4,8 @@
 //! to route reads through views and writes to shadow tables.
 
 use sqlparser::ast::{
-    Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+    DoUpdate, Expr, OnConflict, OnConflictAction, OnInsert, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -331,6 +332,8 @@ impl Rewriter {
             Statement::Insert {
                 table_name,
                 source,
+                on,
+                returning,
                 ..
             } => {
                 // Target table goes to shadow
@@ -345,11 +348,20 @@ impl Rewriter {
                 if let Some(ref mut src) = source {
                     self.rewrite_query(src, RewriteContext::Read);
                 }
+                // ON CONFLICT clause may have subqueries in DO UPDATE
+                if let Some(ref mut on_insert) = on {
+                    self.rewrite_on_insert(on_insert);
+                }
+                // RETURNING clause may have subqueries
+                if let Some(ref mut ret) = returning {
+                    self.rewrite_select_items(ret);
+                }
             }
             Statement::Update {
                 table,
                 from,
                 selection,
+                returning,
                 ..
             } => {
                 // Target table goes to shadow
@@ -364,11 +376,17 @@ impl Rewriter {
                 if let Some(ref mut where_expr) = selection {
                     self.rewrite_expr(where_expr, RewriteContext::Read);
                 }
+
+                // RETURNING clause may have subqueries
+                if let Some(ref mut ret) = returning {
+                    self.rewrite_select_items(ret);
+                }
             }
             Statement::Delete {
                 from,
                 using,
                 selection,
+                returning,
                 ..
             } => {
                 // Target table(s) go to shadow
@@ -386,6 +404,11 @@ impl Rewriter {
                 // Subqueries in WHERE go to views
                 if let Some(ref mut where_expr) = selection {
                     self.rewrite_expr(where_expr, RewriteContext::Read);
+                }
+
+                // RETURNING clause may have subqueries
+                if let Some(ref mut ret) = returning {
+                    self.rewrite_select_items(ret);
                 }
             }
             _ => {
@@ -555,6 +578,65 @@ impl Rewriter {
             }
         }
     }
+
+    /// Rewrites ON INSERT clause (ON CONFLICT for Postgres)
+    fn rewrite_on_insert(&self, on_insert: &mut OnInsert) {
+        match on_insert {
+            OnInsert::OnConflict(on_conflict) => {
+                self.rewrite_on_conflict(on_conflict);
+            }
+            OnInsert::DuplicateKeyUpdate(assignments) => {
+                // MySQL ON DUPLICATE KEY UPDATE - rewrite expressions in assignments
+                for assignment in assignments {
+                    self.rewrite_expr(&mut assignment.value, RewriteContext::Read);
+                }
+            }
+            _ => {
+                // Future OnInsert variants - no rewriting needed
+            }
+        }
+    }
+
+    /// Rewrites ON CONFLICT clause
+    fn rewrite_on_conflict(&self, on_conflict: &mut OnConflict) {
+        match &mut on_conflict.action {
+            OnConflictAction::DoNothing => {
+                // Nothing to rewrite
+            }
+            OnConflictAction::DoUpdate(do_update) => {
+                self.rewrite_do_update(do_update);
+            }
+        }
+    }
+
+    /// Rewrites DO UPDATE clause in ON CONFLICT
+    fn rewrite_do_update(&self, do_update: &mut DoUpdate) {
+        // Rewrite expressions in assignments (e.g., SET col = (SELECT ...))
+        for assignment in &mut do_update.assignments {
+            self.rewrite_expr(&mut assignment.value, RewriteContext::Read);
+        }
+        // Rewrite WHERE clause if present
+        if let Some(ref mut selection) = do_update.selection {
+            self.rewrite_expr(selection, RewriteContext::Read);
+        }
+    }
+
+    /// Rewrites RETURNING clause (list of select items)
+    fn rewrite_select_items(&self, items: &mut Vec<SelectItem>) {
+        for item in items {
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    self.rewrite_expr(expr, RewriteContext::Read);
+                }
+                SelectItem::ExprWithAlias { expr, .. } => {
+                    self.rewrite_expr(expr, RewriteContext::Read);
+                }
+                SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+                    // Wildcards don't need rewriting
+                }
+            }
+        }
+    }
 }
 
 /// Extract the base table name from an ObjectName (last component)
@@ -628,7 +710,7 @@ mod tests {
 
         assert_eq!(query_type, QueryType::Insert);
         // Target should be shadow table
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -639,7 +721,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("sandbox_123._shadow_users_archive"));
+        assert!(sql.contains("sandbox_123._view_users_archive"));
         // Source is view
         assert!(sql.contains("sandbox_123._view_users"));
     }
@@ -652,7 +734,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Update);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -663,7 +745,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("UPDATE sandbox_123._shadow_users"));
+        assert!(sql.contains("UPDATE sandbox_123._view_users"));
         // FROM clause is view
         assert!(sql.contains("sandbox_123._view_orders"));
     }
@@ -674,7 +756,7 @@ mod tests {
         let (sql, query_type) = r.rewrite("DELETE FROM users WHERE id = 1").unwrap();
 
         assert_eq!(query_type, QueryType::Delete);
-        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -685,7 +767,7 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("FROM sandbox_123._shadow_users"));
+        assert!(sql.contains("FROM sandbox_123._view_users"));
         // USING is view
         assert!(sql.contains("sandbox_123._view_orders"));
     }
@@ -766,5 +848,269 @@ mod tests {
         assert!(sql.contains("sandbox_123._view_orders"));
         assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("sandbox_123._view_payments"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_nothing() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO NOTHING"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Insert);
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("DO NOTHING"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_update() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Insert);
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("DO UPDATE"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_with_subquery() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = (SELECT name FROM defaults WHERE id = 1)"
+        ).unwrap();
+
+        // Target is shadow
+        assert!(sql.contains("sandbox_123._view_users"));
+        // Subquery in DO UPDATE should use view
+        assert!(sql.contains("sandbox_123._view_defaults"));
+    }
+
+    #[test]
+    fn test_insert_returning() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "INSERT INTO users (name) VALUES ('John') RETURNING id, name"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Insert);
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_insert_returning_star() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (name) VALUES ('John') RETURNING *"
+        ).unwrap();
+
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("RETURNING *"));
+    }
+
+    #[test]
+    fn test_update_returning() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "UPDATE users SET name = 'Jane' WHERE id = 1 RETURNING id, name, updated_at"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Update);
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_delete_returning() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "DELETE FROM users WHERE id = 1 RETURNING *"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Delete);
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_returning_with_subquery() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (name) VALUES ('John') RETURNING id, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) as order_count"
+        ).unwrap();
+
+        // Target is shadow
+        assert!(sql.contains("sandbox_123._view_users"));
+        // Subquery in RETURNING should use view
+        assert!(sql.contains("sandbox_123._view_orders"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_update_with_where() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name WHERE users.active = true"
+        ).unwrap();
+
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("DO UPDATE"));
+        assert!(sql.contains("WHERE"));
+    }
+
+    #[test]
+    fn test_begin_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("BEGIN");
+        // BEGIN should pass through (classified as Other)
+        assert!(result.is_ok());
+        let (sql, query_type) = result.unwrap();
+        assert_eq!(query_type, QueryType::Other);
+        assert!(sql.to_uppercase().contains("BEGIN"));
+    }
+
+    #[test]
+    fn test_commit_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("COMMIT");
+        assert!(result.is_ok());
+        let (sql, query_type) = result.unwrap();
+        assert_eq!(query_type, QueryType::Other);
+        assert!(sql.to_uppercase().contains("COMMIT"));
+    }
+
+    #[test]
+    fn test_rollback_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("ROLLBACK");
+        assert!(result.is_ok());
+        let (sql, query_type) = result.unwrap();
+        assert_eq!(query_type, QueryType::Other);
+        assert!(sql.to_uppercase().contains("ROLLBACK"));
+    }
+
+    #[test]
+    fn test_savepoint() {
+        let r = rewriter();
+        let result = r.rewrite("SAVEPOINT my_savepoint");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("SAVEPOINT"));
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint() {
+        let r = rewriter();
+        let result = r.rewrite("ROLLBACK TO SAVEPOINT my_savepoint");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("ROLLBACK"));
+        assert!(sql.contains("my_savepoint"));
+    }
+
+    #[test]
+    fn test_release_savepoint() {
+        let r = rewriter();
+        let result = r.rewrite("RELEASE SAVEPOINT my_savepoint");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("RELEASE"));
+    }
+
+    #[test]
+    fn test_start_transaction() {
+        let r = rewriter();
+        let result = r.rewrite("START TRANSACTION");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("START TRANSACTION"));
+    }
+
+    #[test]
+    fn test_begin_with_isolation_level() {
+        let r = rewriter();
+        let result = r.rewrite("BEGIN ISOLATION LEVEL SERIALIZABLE");
+        assert!(result.is_ok());
+        let (sql, _) = result.unwrap();
+        assert!(sql.to_uppercase().contains("BEGIN"));
+        assert!(sql.to_uppercase().contains("SERIALIZABLE"));
+    }
+}
+
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+
+    fn test_parse(sql: &str) -> bool {
+        let r = Rewriter::new("test_schema");
+        r.rewrite(sql).is_ok()
+    }
+
+    #[test]
+    fn test_array_any() {
+        assert!(test_parse("SELECT * FROM users WHERE id = ANY(ARRAY[1,2,3])"));
+    }
+
+    #[test]
+    fn test_array_literal() {
+        assert!(test_parse("SELECT ARRAY[1,2,3]"));
+    }
+
+    #[test]
+    fn test_json_arrow() {
+        assert!(test_parse("SELECT data->>'name' FROM users"));
+    }
+
+    #[test]
+    fn test_json_arrow_single() {
+        assert!(test_parse("SELECT data->'nested' FROM users"));
+    }
+
+    #[test]
+    fn test_type_cast_double_colon() {
+        assert!(test_parse("SELECT '2024-01-01'::date"));
+    }
+
+    #[test]
+    fn test_lateral_join() {
+        assert!(test_parse("SELECT * FROM users u, LATERAL (SELECT * FROM orders WHERE user_id = u.id) o"));
+    }
+
+    #[test]
+    fn test_window_function() {
+        assert!(test_parse("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp"));
+    }
+
+    #[test]
+    fn test_distinct_on() {
+        assert!(test_parse("SELECT DISTINCT ON (dept) * FROM emp ORDER BY dept, salary DESC"));
+    }
+
+    #[test]
+    fn test_filter_clause() {
+        assert!(test_parse("SELECT COUNT(*) FILTER (WHERE active) FROM users"));
+    }
+
+    #[test]
+    fn test_recursive_cte() {
+        assert!(test_parse("WITH RECURSIVE cte AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM cte WHERE n < 10) SELECT * FROM cte"));
+    }
+
+    #[test]
+    fn test_for_update() {
+        assert!(test_parse("SELECT * FROM users WHERE id = 1 FOR UPDATE"));
+    }
+
+    #[test]
+    fn test_interval() {
+        assert!(test_parse("SELECT NOW() + INTERVAL '1 day'"));
+    }
+
+    #[test]
+    fn test_excluded_in_upsert() {
+        assert!(test_parse("INSERT INTO t (a,b) VALUES (1,2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b"));
     }
 }

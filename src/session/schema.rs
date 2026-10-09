@@ -1,6 +1,6 @@
 use deadpool_postgres::Pool;
 use thiserror::Error;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// Represents a primary key column with its name and PostgreSQL data type
 #[derive(Debug, Clone)]
@@ -89,6 +89,21 @@ impl SchemaManager {
             quote_ident(schema_name)
         );
         client.execute(&create_expected, &[]).await?;
+
+        // Create _mlb_row_hashes table for conflict detection
+        let create_hashes = format!(
+            r#"
+            CREATE TABLE {}._mlb_row_hashes (
+                table_name VARCHAR(255) NOT NULL,
+                pk_value VARCHAR(255) NOT NULL,
+                hash VARCHAR(32) NOT NULL,
+                captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (table_name, pk_value)
+            )
+            "#,
+            quote_ident(schema_name)
+        );
+        client.execute(&create_hashes, &[]).await?;
 
         debug!(schema = schema_name, "Created tracking tables");
 
@@ -214,6 +229,89 @@ impl SchemaManager {
             }
         }
 
+        // Get primary key and columns for hash capture trigger
+        if let Ok(pk_col) = self.get_primary_key(source_schema, table_name).await {
+            // Get all columns for hash computation (exclude _mlb_* columns)
+            let columns: Vec<String> = client
+                .query(
+                    r#"
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = $1 AND table_name = $2
+                    ORDER BY ordinal_position
+                    "#,
+                    &[&source_schema, &table_name],
+                )
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.get::<_, String>("column_name"))
+                .collect();
+
+            if !columns.is_empty() {
+                let hash_cols = columns
+                    .iter()
+                    .map(|c| format!("p.{}", quote_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let func_name = format!(
+                    "{}.capture_hash_{}",
+                    quote_ident(session_schema),
+                    safe_ident(table_name)
+                );
+
+                // Create trigger function to capture production hash on first write
+                let create_func = format!(
+                    r#"
+                    CREATE OR REPLACE FUNCTION {}()
+                    RETURNS TRIGGER AS $$
+                    BEGIN
+                        INSERT INTO {}._mlb_row_hashes (table_name, pk_value, hash)
+                        SELECT '{table_name}', NEW.{pk}::TEXT, MD5(CONCAT_WS('|', {hash_cols}))
+                        FROM {source_schema}.{table_name} p
+                        WHERE p.{pk} = NEW.{pk}
+                        ON CONFLICT (table_name, pk_value) DO NOTHING;
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql
+                    "#,
+                    func_name,
+                    quote_ident(session_schema),
+                    table_name = table_name,
+                    pk = quote_ident(&pk_col),
+                    hash_cols = hash_cols,
+                    source_schema = quote_ident(source_schema),
+                );
+
+                if let Err(e) = client.execute(&create_func, &[]).await {
+                    warn!(error = %e, "Failed to create hash capture function");
+                } else {
+                    // Create trigger
+                    let trigger_name = format!("trg_capture_hash_{}", safe_ident(table_name));
+                    let create_trigger = format!(
+                        r#"
+                        CREATE TRIGGER {}
+                        BEFORE INSERT OR UPDATE ON {}
+                        FOR EACH ROW EXECUTE FUNCTION {}()
+                        "#,
+                        quote_ident(&trigger_name),
+                        shadow_table,
+                        func_name,
+                    );
+
+                    if let Err(e) = client.execute(&create_trigger, &[]).await {
+                        warn!(error = %e, "Failed to create hash capture trigger");
+                    } else {
+                        debug!(
+                            table = table_name,
+                            "Created hash capture trigger for conflict detection"
+                        );
+                    }
+                }
+            }
+        }
+
         client
             .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
             .await?;
@@ -231,20 +329,42 @@ impl SchemaManager {
         let client = self.pool.get().await?;
 
         let view_name = format!(
-            "{}._view_{}",
+            "{}.{}",
             quote_ident(schema_name),
-            quote_ident(table_name)
+            quote_ident(&format!("_view_{}", table_name))
         );
-        let shadow_table = format!("{}.{}", quote_ident(schema_name), quote_ident(table_name));
+        let shadow_table = format!(
+            "{}.{}",
+            quote_ident(schema_name),
+            quote_ident(&format!("_shadow_{}", table_name))
+        );
         let source_table = format!("{}.{}", quote_ident(source_schema), quote_ident(table_name));
         let deletes_table = format!("{}._deletes", quote_ident(schema_name));
+
+        // Get all columns for the table (needed for view to exclude _mlb_* columns)
+        let columns: Vec<String> = client
+            .query(
+                r#"
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = $1 AND table_name = $2
+                ORDER BY ordinal_position
+                "#,
+                &[&source_schema, &table_name],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get::<_, String>("column_name"))
+            .collect();
+
+        let col_list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
 
         let create_view = format!(
             r#"
             CREATE OR REPLACE VIEW {} AS
-            SELECT * FROM {}
+            SELECT {} FROM {}
             UNION ALL
-            SELECT s.* FROM {} s
+            SELECT {} FROM {} s
             WHERE NOT EXISTS (
                 SELECT 1 FROM {} sh WHERE sh.{pk} = s.{pk}
             )
@@ -253,7 +373,9 @@ impl SchemaManager {
             )
             "#,
             view_name,
+            col_list,
             shadow_table,
+            col_list,
             source_table,
             shadow_table,
             deletes_table,
@@ -263,10 +385,133 @@ impl SchemaManager {
 
         client.execute(&create_view, &[]).await?;
 
+        let new_col_list = columns.iter().map(|c| format!("NEW.{}", quote_ident(c))).collect::<Vec<_>>().join(", ");
+        let update_set = columns.iter()
+            .filter(|c| c.as_str() != primary_key)
+            .map(|c| format!("{} = NEW.{}", quote_ident(c), quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Create INSTEAD OF UPDATE trigger function
+        let update_func = format!(
+            r#"
+            CREATE OR REPLACE FUNCTION {schema}.instead_update_{safe_table}()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                -- Copy row to shadow if not exists (copy-on-write)
+                INSERT INTO {schema}.{shadow_table} ({col_list}, _mlb_op, _mlb_ts)
+                SELECT {col_list}, 'UPDATE', NOW()
+                FROM {source_schema}.{table_name}
+                WHERE {pk} = OLD.{pk}
+                  AND NOT EXISTS (SELECT 1 FROM {schema}.{shadow_table} WHERE {pk} = OLD.{pk})
+                ON CONFLICT ({pk}) DO NOTHING;
+
+                -- Now update the shadow row
+                UPDATE {schema}.{shadow_table}
+                SET {update_set}, _mlb_op = 'UPDATE', _mlb_ts = NOW()
+                WHERE {pk} = OLD.{pk};
+
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+            schema = quote_ident(schema_name),
+            safe_table = safe_ident(table_name),
+            shadow_table = quote_ident(&format!("_shadow_{}", table_name)),
+            source_schema = quote_ident(source_schema),
+            table_name = quote_ident(table_name),
+            pk = quote_ident(primary_key),
+            col_list = col_list,
+            update_set = update_set,
+        );
+        client.execute(&update_func, &[]).await?;
+
+        let update_trigger = format!(
+            r#"
+            CREATE TRIGGER trg_instead_update_{safe_table}
+            INSTEAD OF UPDATE ON {view_name}
+            FOR EACH ROW EXECUTE FUNCTION {schema}.instead_update_{safe_table}()
+            "#,
+            safe_table = safe_ident(table_name),
+            view_name = view_name,
+            schema = quote_ident(schema_name),
+        );
+        client.execute(&update_trigger, &[]).await?;
+
+        // Create INSTEAD OF DELETE trigger function
+        let delete_func = format!(
+            r#"
+            CREATE OR REPLACE FUNCTION {schema}.instead_delete_{safe_table}()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                -- If row exists in shadow, delete it
+                DELETE FROM {schema}.{shadow_table} WHERE {pk} = OLD.{pk};
+
+                -- Record deletion (works for both shadow-only and prod rows)
+                INSERT INTO {schema}._deletes (table_name, row_id)
+                VALUES ('{table_name}', OLD.{pk}::TEXT)
+                ON CONFLICT (table_name, row_id) DO NOTHING;
+
+                RETURN OLD;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+            schema = quote_ident(schema_name),
+            safe_table = safe_ident(table_name),
+            shadow_table = quote_ident(&format!("_shadow_{}", table_name)),
+            table_name = table_name,
+            pk = quote_ident(primary_key),
+        );
+        client.execute(&delete_func, &[]).await?;
+
+        let delete_trigger = format!(
+            r#"
+            CREATE TRIGGER trg_instead_delete_{safe_table}
+            INSTEAD OF DELETE ON {view_name}
+            FOR EACH ROW EXECUTE FUNCTION {schema}.instead_delete_{safe_table}()
+            "#,
+            safe_table = safe_ident(table_name),
+            view_name = view_name,
+            schema = quote_ident(schema_name),
+        );
+        client.execute(&delete_trigger, &[]).await?;
+
+        // Create INSTEAD OF INSERT trigger function (for completeness)
+        let insert_func = format!(
+            r#"
+            CREATE OR REPLACE FUNCTION {schema}.instead_insert_{safe_table}()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                INSERT INTO {schema}.{shadow_table} ({col_list}, _mlb_op, _mlb_ts)
+                VALUES ({new_col_list}, 'INSERT', NOW());
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+            schema = quote_ident(schema_name),
+            safe_table = safe_ident(table_name),
+            shadow_table = quote_ident(&format!("_shadow_{}", table_name)),
+            col_list = col_list,
+            new_col_list = new_col_list,
+        );
+        client.execute(&insert_func, &[]).await?;
+
+        let insert_trigger = format!(
+            r#"
+            CREATE TRIGGER trg_instead_insert_{safe_table}
+            INSTEAD OF INSERT ON {view_name}
+            FOR EACH ROW EXECUTE FUNCTION {schema}.instead_insert_{safe_table}()
+            "#,
+            safe_table = safe_ident(table_name),
+            view_name = view_name,
+            schema = quote_ident(schema_name),
+        );
+        client.execute(&insert_trigger, &[]).await?;
+
         debug!(
             schema = schema_name,
             table = table_name,
-            "Created union view"
+            "Created union view with INSTEAD OF triggers"
         );
 
         Ok(())
@@ -647,6 +892,14 @@ impl SchemaManager {
 
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Create a safe identifier for function/trigger names (alphanumeric + underscore only)
+fn safe_ident(ident: &str) -> String {
+    ident
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
 }
 
 /// Validate that a data type string from pg_catalog is safe to use in SQL.

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use deadpool_postgres::{Config as PgConfig, Runtime};
 
@@ -60,10 +61,29 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for both
+    // Start background cleanup task
+    let cleanup_session_mgr = Arc::clone(&session_manager);
+    let cleanup_handle = tokio::spawn(async move {
+        let interval = Duration::from_secs(60); // Run every minute
+        loop {
+            tokio::time::sleep(interval).await;
+            match cleanup_session_mgr.cleanup_expired().await {
+                Ok(count) if count > 0 => {
+                    tracing::debug!(count, "Background cleanup completed");
+                }
+                Ok(_) => {} // No sessions to clean up
+                Err(e) => {
+                    tracing::warn!(error = %e, "Background cleanup failed");
+                }
+            }
+        }
+    });
+
+    // Wait for servers (cleanup runs forever in background)
     tokio::select! {
         _ = api_handle => tracing::warn!("API server stopped"),
         _ = proxy_handle => tracing::warn!("Proxy server stopped"),
+        _ = cleanup_handle => tracing::warn!("Cleanup task stopped"),
     }
 
     Ok(())
