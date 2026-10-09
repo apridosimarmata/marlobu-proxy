@@ -10,6 +10,9 @@ pub enum ReadError {
 
     #[error("Table not found: {0}")]
     TableNotFound(String),
+
+    #[error("No primary key found for table: {0}")]
+    NoPrimaryKeyFound(String),
 }
 
 /// Ensure a view exists for reading a table in the sandbox
@@ -103,5 +106,5 @@ pub async fn get_primary_key(
     ).await?;
 
     row.map(|r| r.get("attname"))
-        .ok_or_else(|| ReadError::TableNotFound(table_name.to_string()))
+        .ok_or_else(|| ReadError::NoPrimaryKeyFound(table_name.to_string()))
 }
