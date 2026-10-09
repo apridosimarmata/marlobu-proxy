@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::approval::conflict::{check_row_hash_conflicts, ConflictType};
 use crate::approval::diff::{generate_session_diff, SessionDiff};
-use crate::session::{Session, SessionManager, SessionStatus};
+use crate::session::{get_session_mutations, Session, SessionManager, SessionStatus};
 
 // ============================================================================
 // Application State
@@ -86,12 +86,10 @@ pub struct MutationsResponse {
 
 #[derive(Debug, Serialize)]
 pub struct Mutation {
-    pub id: String,
     pub table: String,
     pub operation: String,
-    pub row_id: Option<String>,
-    pub data: serde_json::Value,
-    pub created_at: DateTime<Utc>,
+    pub row_id: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,13 +464,48 @@ pub async fn reject_session(
 
 /// GET /sessions/:id/mutations - Get staged mutations for session
 pub async fn get_mutations(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MutationsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Implement mutation tracking
+    // Get session to retrieve schema name
+    let session = state.session_manager.get(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    // Query mutations from shadow and deleted tables
+    let mutation_records = get_session_mutations(state.session_manager.pool(), &session.schema_name)
+        .await
+        .map_err(|e| {
+            error!(session_id = %id, error = %e, "Failed to get mutations");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+
+    // Convert to response format
+    let mutations: Vec<Mutation> = mutation_records
+        .into_iter()
+        .map(|rec| Mutation {
+            table: rec.table,
+            operation: rec.operation,
+            row_id: rec.row_id,
+            timestamp: rec.timestamp,
+        })
+        .collect();
+
+    info!(session_id = %id, mutation_count = mutations.len(), "Retrieved mutations");
+
     Ok(Json(MutationsResponse {
         session_id: id.to_string(),
-        mutations: vec![],
+        mutations,
     }))
 }
 
@@ -482,4 +515,39 @@ pub async fn health_check() -> Json<HealthResponse> {
         status: "healthy".to_string(),
         timestamp: Utc::now(),
     })
+}
+
+/// GET /sessions/:id/diff - Get diff of all changes in a session
+pub async fn get_session_diff(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SessionDiff>, (StatusCode, Json<ErrorResponse>)> {
+    let session = state.session_manager.get(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let tables = generate_session_diff(
+        state.session_manager.pool(),
+        &session.schema_name,
+        "public",
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    Ok(Json(SessionDiff {
+        session_id: id.to_string(),
+        tables,
+    }))
 }
