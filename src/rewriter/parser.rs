@@ -46,6 +46,26 @@ impl QueryType {
     }
 }
 
+/// Table reference with its context (read or write)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    /// Table name (without schema)
+    pub name: String,
+    /// Whether this is a write target
+    pub is_write_target: bool,
+}
+
+/// Result of query analysis
+#[derive(Debug)]
+pub struct QueryAnalysis {
+    /// Rewritten SQL
+    pub sql: String,
+    /// Query type
+    pub query_type: QueryType,
+    /// Tables referenced (for infrastructure setup)
+    pub tables: Vec<TableRef>,
+}
+
 /// SQL query rewriter for sandbox isolation.
 pub struct Rewriter {
     /// Target schema for rewritten queries
@@ -67,6 +87,14 @@ impl Rewriter {
     ///
     /// Returns the rewritten SQL and its query type.
     pub fn rewrite(&self, sql: &str) -> Result<(String, QueryType), RewriterError> {
+        let analysis = self.analyze(sql)?;
+        Ok((analysis.sql, analysis.query_type))
+    }
+
+    /// Parses, rewrites, and analyzes a SQL query.
+    ///
+    /// Returns full analysis including tables referenced (for infrastructure setup).
+    pub fn analyze(&self, sql: &str) -> Result<QueryAnalysis, RewriterError> {
         let mut statements = Parser::parse_sql(&self.dialect, sql)
             .map_err(|e| RewriterError::ParseError(e.to_string()))?;
 
@@ -84,10 +112,161 @@ impl Rewriter {
         // Block dangerous statements
         self.check_blocked(&stmt)?;
 
+        // Extract tables before rewriting (to get original names)
+        let tables = self.extract_tables(&stmt);
+
         // Rewrite table references
         self.rewrite_statement(&mut stmt)?;
 
-        Ok((stmt.to_string(), query_type))
+        Ok(QueryAnalysis {
+            sql: stmt.to_string(),
+            query_type,
+            tables,
+        })
+    }
+
+    /// Extract table references from a statement
+    fn extract_tables(&self, stmt: &Statement) -> Vec<TableRef> {
+        let mut tables = Vec::new();
+
+        match stmt {
+            Statement::Query(query) => {
+                self.extract_tables_from_query(query, &mut tables, false);
+            }
+            Statement::Insert { table_name, source, .. } => {
+                // Target table is a write target
+                if let Some(name) = extract_table_name_str(table_name) {
+                    if !is_system_table(&name) {
+                        tables.push(TableRef { name, is_write_target: true });
+                    }
+                }
+                // Source query tables are read targets
+                if let Some(src) = source {
+                    self.extract_tables_from_query(src, &mut tables, false);
+                }
+            }
+            Statement::Update { table, from, selection, .. } => {
+                // Target table is a write target
+                self.extract_tables_from_table_with_joins(table, &mut tables, true);
+                // FROM clause is read
+                if let Some(from_table) = from {
+                    self.extract_tables_from_table_with_joins(from_table, &mut tables, false);
+                }
+                // Subqueries in WHERE are read
+                if let Some(where_expr) = selection {
+                    self.extract_tables_from_expr(where_expr, &mut tables);
+                }
+            }
+            Statement::Delete { from, using, selection, .. } => {
+                // Target table(s) are write targets
+                for table_with_joins in from {
+                    self.extract_tables_from_table_with_joins(table_with_joins, &mut tables, true);
+                }
+                // USING clause is read
+                if let Some(using_clause) = using {
+                    for table_with_joins in using_clause {
+                        self.extract_tables_from_table_with_joins(table_with_joins, &mut tables, false);
+                    }
+                }
+                // Subqueries in WHERE are read
+                if let Some(where_expr) = selection {
+                    self.extract_tables_from_expr(where_expr, &mut tables);
+                }
+            }
+            _ => {}
+        }
+
+        // Deduplicate tables (keep first occurrence)
+        let mut seen = std::collections::HashSet::new();
+        tables.retain(|t| seen.insert(t.name.clone()));
+
+        tables
+    }
+
+    fn extract_tables_from_query(&self, query: &Query, tables: &mut Vec<TableRef>, is_write: bool) {
+        // Handle CTEs
+        if let Some(ref with) = query.with {
+            for cte in &with.cte_tables {
+                self.extract_tables_from_query(&cte.query, tables, false);
+            }
+        }
+        self.extract_tables_from_set_expr(&query.body, tables, is_write);
+    }
+
+    fn extract_tables_from_set_expr(&self, set_expr: &SetExpr, tables: &mut Vec<TableRef>, is_write: bool) {
+        match set_expr {
+            SetExpr::Select(select) => {
+                self.extract_tables_from_select(select, tables, is_write);
+            }
+            SetExpr::Query(query) => {
+                self.extract_tables_from_query(query, tables, is_write);
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.extract_tables_from_set_expr(left, tables, is_write);
+                self.extract_tables_from_set_expr(right, tables, is_write);
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_tables_from_select(&self, select: &Select, tables: &mut Vec<TableRef>, is_write: bool) {
+        for table_with_joins in &select.from {
+            self.extract_tables_from_table_with_joins(table_with_joins, tables, is_write);
+        }
+        if let Some(ref selection) = select.selection {
+            self.extract_tables_from_expr(selection, tables);
+        }
+    }
+
+    fn extract_tables_from_table_with_joins(&self, table: &TableWithJoins, tables: &mut Vec<TableRef>, is_write: bool) {
+        self.extract_tables_from_table_factor(&table.relation, tables, is_write);
+        for join in &table.joins {
+            self.extract_tables_from_table_factor(&join.relation, tables, false);
+        }
+    }
+
+    fn extract_tables_from_table_factor(&self, factor: &TableFactor, tables: &mut Vec<TableRef>, is_write: bool) {
+        match factor {
+            TableFactor::Table { name, .. } => {
+                if let Some(table_name) = extract_table_name_str(name) {
+                    if !is_system_table(&table_name) {
+                        tables.push(TableRef { name: table_name, is_write_target: is_write });
+                    }
+                }
+            }
+            TableFactor::Derived { subquery, .. } => {
+                self.extract_tables_from_query(subquery, tables, false);
+            }
+            TableFactor::NestedJoin { table_with_joins, .. } => {
+                self.extract_tables_from_table_with_joins(table_with_joins, tables, is_write);
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_tables_from_expr(&self, expr: &Expr, tables: &mut Vec<TableRef>) {
+        match expr {
+            Expr::Subquery(query) => {
+                self.extract_tables_from_query(query, tables, false);
+            }
+            Expr::InSubquery { subquery, .. } => {
+                self.extract_tables_from_query(subquery, tables, false);
+            }
+            Expr::Exists { subquery, .. } => {
+                self.extract_tables_from_query(subquery, tables, false);
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.extract_tables_from_expr(left, tables);
+                self.extract_tables_from_expr(right, tables);
+            }
+            Expr::UnaryOp { expr: inner, .. } => {
+                self.extract_tables_from_expr(inner, tables);
+            }
+            Expr::Nested(inner) => {
+                self.extract_tables_from_expr(inner, tables);
+            }
+            _ => {}
+        }
     }
 
     /// Classifies a statement by query type.
@@ -378,6 +557,19 @@ impl Rewriter {
     }
 }
 
+/// Extract the base table name from an ObjectName (last component)
+fn extract_table_name_str(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    name.0.last().map(|ident| ident.value.clone())
+}
+
+/// Check if a table name is a system table that should not be rewritten
+fn is_system_table(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with("pg_")
+        || lower.starts_with("information_schema")
+        || matches!(lower.as_str(), "dual" | "sqlite_master" | "sqlite_sequence")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,7 +584,7 @@ mod tests {
         let (sql, query_type) = r.rewrite("SELECT * FROM users").unwrap();
 
         assert_eq!(query_type, QueryType::Select);
-        assert!(sql.contains("sandbox_123.users_view"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -402,8 +594,8 @@ mod tests {
             "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id"
         ).unwrap();
 
-        assert!(sql.contains("sandbox_123.users_view"));
-        assert!(sql.contains("sandbox_123.orders_view"));
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("sandbox_123._view_orders"));
     }
 
     #[test]
@@ -413,8 +605,8 @@ mod tests {
             "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)"
         ).unwrap();
 
-        assert!(sql.contains("sandbox_123.users_view"));
-        assert!(sql.contains("sandbox_123.orders_view"));
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("sandbox_123._view_orders"));
     }
 
     #[test]
@@ -424,7 +616,7 @@ mod tests {
             "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active"
         ).unwrap();
 
-        assert!(sql.contains("sandbox_123.users_view"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -435,9 +627,8 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Insert);
-        // Target should be shadow table, not view
-        assert!(sql.contains("sandbox_123.users"));
-        assert!(!sql.contains("users_view"));
+        // Target should be shadow table
+        assert!(sql.contains("sandbox_123._shadow_users"));
     }
 
     #[test]
@@ -448,9 +639,9 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("sandbox_123.users_archive"));
+        assert!(sql.contains("sandbox_123._shadow_users_archive"));
         // Source is view
-        assert!(sql.contains("sandbox_123.users_view"));
+        assert!(sql.contains("sandbox_123._view_users"));
     }
 
     #[test]
@@ -461,8 +652,7 @@ mod tests {
         ).unwrap();
 
         assert_eq!(query_type, QueryType::Update);
-        assert!(sql.contains("sandbox_123.users"));
-        assert!(!sql.contains("users_view"));
+        assert!(sql.contains("sandbox_123._shadow_users"));
     }
 
     #[test]
@@ -473,9 +663,9 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("UPDATE sandbox_123.users"));
+        assert!(sql.contains("UPDATE sandbox_123._shadow_users"));
         // FROM clause is view
-        assert!(sql.contains("sandbox_123.orders_view"));
+        assert!(sql.contains("sandbox_123._view_orders"));
     }
 
     #[test]
@@ -484,8 +674,7 @@ mod tests {
         let (sql, query_type) = r.rewrite("DELETE FROM users WHERE id = 1").unwrap();
 
         assert_eq!(query_type, QueryType::Delete);
-        assert!(sql.contains("sandbox_123.users"));
-        assert!(!sql.contains("users_view"));
+        assert!(sql.contains("sandbox_123._shadow_users"));
     }
 
     #[test]
@@ -496,9 +685,9 @@ mod tests {
         ).unwrap();
 
         // Target is shadow table
-        assert!(sql.contains("FROM sandbox_123.users"));
+        assert!(sql.contains("FROM sandbox_123._shadow_users"));
         // USING is view
-        assert!(sql.contains("sandbox_123.orders_view"));
+        assert!(sql.contains("sandbox_123._view_orders"));
     }
 
     #[test]
@@ -574,8 +763,8 @@ mod tests {
             ORDER BY ro.total DESC
         "#).unwrap();
 
-        assert!(sql.contains("sandbox_123.orders_view"));
-        assert!(sql.contains("sandbox_123.users_view"));
-        assert!(sql.contains("sandbox_123.payments_view"));
+        assert!(sql.contains("sandbox_123._view_orders"));
+        assert!(sql.contains("sandbox_123._view_users"));
+        assert!(sql.contains("sandbox_123._view_payments"));
     }
 }
