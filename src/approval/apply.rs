@@ -19,6 +19,12 @@ pub enum ApplyError {
 
     #[error("Session not in pending_review status")]
     InvalidStatus,
+
+    #[error("Invalid data type: {0}")]
+    InvalidDataType(String),
+
+    #[error("Unexpected conflicts detected")]
+    UnexpectedConflicts,
 }
 
 /// Apply all staged changes from a session to production
@@ -47,10 +53,11 @@ pub async fn apply_session(
     let conflicts = check_conflicts(client, schema_name, &conflict_checks).await
         .map_err(|e| match e {
             ConflictError::Database(e) => ApplyError::Database(e),
-            ConflictError::ConflictsDetected(c) => {
+            ConflictError::ConflictsDetected(_) => {
                 // This shouldn't happen since check_conflicts returns Ok with conflicts
-                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+                ApplyError::UnexpectedConflicts
             }
+            ConflictError::InvalidDataType(msg) => ApplyError::InvalidDataType(msg),
         })?;
 
     if !conflicts.is_empty() && !force {
