@@ -4,7 +4,8 @@
 //! to route reads through views and writes to shadow tables.
 
 use sqlparser::ast::{
-    Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+    DoUpdate, Expr, OnConflict, OnConflictAction, OnInsert, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -331,6 +332,8 @@ impl Rewriter {
             Statement::Insert {
                 table_name,
                 source,
+                on,
+                returning,
                 ..
             } => {
                 // Target table goes to shadow
@@ -345,11 +348,20 @@ impl Rewriter {
                 if let Some(ref mut src) = source {
                     self.rewrite_query(src, RewriteContext::Read);
                 }
+                // ON CONFLICT clause may have subqueries in DO UPDATE
+                if let Some(ref mut on_insert) = on {
+                    self.rewrite_on_insert(on_insert);
+                }
+                // RETURNING clause may have subqueries
+                if let Some(ref mut ret) = returning {
+                    self.rewrite_select_items(ret);
+                }
             }
             Statement::Update {
                 table,
                 from,
                 selection,
+                returning,
                 ..
             } => {
                 // Target table goes to shadow
@@ -364,11 +376,17 @@ impl Rewriter {
                 if let Some(ref mut where_expr) = selection {
                     self.rewrite_expr(where_expr, RewriteContext::Read);
                 }
+
+                // RETURNING clause may have subqueries
+                if let Some(ref mut ret) = returning {
+                    self.rewrite_select_items(ret);
+                }
             }
             Statement::Delete {
                 from,
                 using,
                 selection,
+                returning,
                 ..
             } => {
                 // Target table(s) go to shadow
@@ -386,6 +404,11 @@ impl Rewriter {
                 // Subqueries in WHERE go to views
                 if let Some(ref mut where_expr) = selection {
                     self.rewrite_expr(where_expr, RewriteContext::Read);
+                }
+
+                // RETURNING clause may have subqueries
+                if let Some(ref mut ret) = returning {
+                    self.rewrite_select_items(ret);
                 }
             }
             _ => {
@@ -552,6 +575,65 @@ impl Rewriter {
             }
             _ => {
                 // Other expressions don't contain table references we need to rewrite
+            }
+        }
+    }
+
+    /// Rewrites ON INSERT clause (ON CONFLICT for Postgres)
+    fn rewrite_on_insert(&self, on_insert: &mut OnInsert) {
+        match on_insert {
+            OnInsert::OnConflict(on_conflict) => {
+                self.rewrite_on_conflict(on_conflict);
+            }
+            OnInsert::DuplicateKeyUpdate(assignments) => {
+                // MySQL ON DUPLICATE KEY UPDATE - rewrite expressions in assignments
+                for assignment in assignments {
+                    self.rewrite_expr(&mut assignment.value, RewriteContext::Read);
+                }
+            }
+            _ => {
+                // Future OnInsert variants - no rewriting needed
+            }
+        }
+    }
+
+    /// Rewrites ON CONFLICT clause
+    fn rewrite_on_conflict(&self, on_conflict: &mut OnConflict) {
+        match &mut on_conflict.action {
+            OnConflictAction::DoNothing => {
+                // Nothing to rewrite
+            }
+            OnConflictAction::DoUpdate(do_update) => {
+                self.rewrite_do_update(do_update);
+            }
+        }
+    }
+
+    /// Rewrites DO UPDATE clause in ON CONFLICT
+    fn rewrite_do_update(&self, do_update: &mut DoUpdate) {
+        // Rewrite expressions in assignments (e.g., SET col = (SELECT ...))
+        for assignment in &mut do_update.assignments {
+            self.rewrite_expr(&mut assignment.value, RewriteContext::Read);
+        }
+        // Rewrite WHERE clause if present
+        if let Some(ref mut selection) = do_update.selection {
+            self.rewrite_expr(selection, RewriteContext::Read);
+        }
+    }
+
+    /// Rewrites RETURNING clause (list of select items)
+    fn rewrite_select_items(&self, items: &mut Vec<SelectItem>) {
+        for item in items {
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    self.rewrite_expr(expr, RewriteContext::Read);
+                }
+                SelectItem::ExprWithAlias { expr, .. } => {
+                    self.rewrite_expr(expr, RewriteContext::Read);
+                }
+                SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+                    // Wildcards don't need rewriting
+                }
             }
         }
     }
@@ -766,5 +848,116 @@ mod tests {
         assert!(sql.contains("sandbox_123._view_orders"));
         assert!(sql.contains("sandbox_123._view_users"));
         assert!(sql.contains("sandbox_123._view_payments"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_nothing() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO NOTHING"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Insert);
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("DO NOTHING"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_update() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Insert);
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("DO UPDATE"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_with_subquery() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = (SELECT name FROM defaults WHERE id = 1)"
+        ).unwrap();
+
+        // Target is shadow
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        // Subquery in DO UPDATE should use view
+        assert!(sql.contains("sandbox_123._view_defaults"));
+    }
+
+    #[test]
+    fn test_insert_returning() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "INSERT INTO users (name) VALUES ('John') RETURNING id, name"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Insert);
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_insert_returning_star() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (name) VALUES ('John') RETURNING *"
+        ).unwrap();
+
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("RETURNING *"));
+    }
+
+    #[test]
+    fn test_update_returning() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "UPDATE users SET name = 'Jane' WHERE id = 1 RETURNING id, name, updated_at"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Update);
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_delete_returning() {
+        let r = rewriter();
+        let (sql, query_type) = r.rewrite(
+            "DELETE FROM users WHERE id = 1 RETURNING *"
+        ).unwrap();
+
+        assert_eq!(query_type, QueryType::Delete);
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_returning_with_subquery() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (name) VALUES ('John') RETURNING id, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) as order_count"
+        ).unwrap();
+
+        // Target is shadow
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        // Subquery in RETURNING should use view
+        assert!(sql.contains("sandbox_123._view_orders"));
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_update_with_where() {
+        let r = rewriter();
+        let (sql, _) = r.rewrite(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name WHERE users.active = true"
+        ).unwrap();
+
+        assert!(sql.contains("sandbox_123._shadow_users"));
+        assert!(sql.contains("DO UPDATE"));
+        assert!(sql.contains("WHERE"));
     }
 }
