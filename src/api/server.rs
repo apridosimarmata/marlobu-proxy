@@ -23,14 +23,14 @@ pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
     Router::new()
         // Session CRUD
         .route("/sessions", post(create_session))
-        .route("/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/sessions/:id", get(get_session).delete(delete_session))
         // Session workflow
-        .route("/sessions/{id}/propose", post(propose_session))
-        .route("/sessions/{id}/approve", post(approve_session))
-        .route("/sessions/{id}/reject", post(reject_session))
+        .route("/sessions/:id/propose", post(propose_session))
+        .route("/sessions/:id/approve", post(approve_session))
+        .route("/sessions/:id/reject", post(reject_session))
         // Session data
-        .route("/sessions/{id}/mutations", get(get_mutations))
-        .route("/sessions/{id}/diff", get(get_session_diff))
+        .route("/sessions/:id/mutations", get(get_mutations))
+        .route("/sessions/:id/diff", get(get_session_diff))
         // Health
         .route("/health", get(health_check))
         // Middleware

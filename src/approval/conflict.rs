@@ -304,6 +304,25 @@ pub async fn check_row_hash_conflicts(
 
     let mut conflicts = Vec::new();
 
+    // Check if _mlb_row_hashes table exists
+    let table_exists: bool = client
+        .query_one(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = $1 AND table_name = '_mlb_row_hashes'
+            ) as exists
+            "#,
+            &[&session_schema],
+        )
+        .await?
+        .get("exists");
+
+    if !table_exists {
+        debug!(session_schema = session_schema, "No _mlb_row_hashes table, skipping conflict check");
+        return Ok(conflicts);
+    }
+
     // Get all tracked row hashes
     let tracked_rows = client
         .query(
