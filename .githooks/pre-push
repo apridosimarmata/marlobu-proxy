@@ -1,0 +1,17 @@
+#!/bin/bash
+# Pre-push hook: runs the same checks as CI
+
+set -e
+
+echo "Running pre-push checks..."
+
+echo "→ cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "→ cargo clippy"
+cargo clippy --all-targets --all-features -- -D warnings
+
+echo "→ cargo test"
+cargo test --all-features
+
+echo "✓ All checks passed"
