@@ -2,6 +2,7 @@ use thiserror::Error;
 use tokio_postgres::Transaction;
 
 use super::conflict::{check_conflicts, Conflict, ConflictError, TableConflictCheck};
+use tracing::error;
 
 #[derive(Debug)]
 pub enum ApplyResult {
@@ -19,6 +20,12 @@ pub enum ApplyError {
 
     #[error("Session not in pending_review status")]
     InvalidStatus,
+
+    #[error("Primary key not found for table: {0}")]
+    PrimaryKeyNotFound(String),
+
+    #[error("Unexpected conflict error")]
+    UnexpectedConflict,
 }
 
 /// Apply all staged changes from a session to production
@@ -47,13 +54,14 @@ pub async fn apply_session(
     let conflicts = check_conflicts(client, schema_name, &conflict_checks).await
         .map_err(|e| match e {
             ConflictError::Database(e) => ApplyError::Database(e),
-            ConflictError::PrimaryKeyNotFound(_) => {
-                // Primary key not found during conflict check - treat as DB error
-                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+            ConflictError::PrimaryKeyNotFound(table) => {
+                error!(table = %table, "Primary key not found during conflict check");
+                ApplyError::PrimaryKeyNotFound(table)
             }
             ConflictError::ConflictsDetected(_) => {
                 // This shouldn't happen since check_conflicts returns Ok with conflicts
-                ApplyError::Database(tokio_postgres::Error::__private_api_timeout())
+                error!("Unexpected ConflictsDetected error variant");
+                ApplyError::UnexpectedConflict
             }
         })?;
 

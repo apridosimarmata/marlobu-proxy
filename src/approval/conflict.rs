@@ -216,14 +216,21 @@ pub async fn capture_row_hash(
         return Ok(Some(hash));
     }
 
-    // Calculate MD5 hash of the row from source schema
-    // Using ROW(t.*)::TEXT for a stable text representation of all columns
+    // Get hash columns for stable, deterministic hashing
+    let hash_columns = get_hash_columns(client, table_name).await?;
+    if hash_columns.is_empty() {
+        warn!(table = table_name, "No columns found for hash computation");
+        return Ok(None);
+    }
+
+    // Calculate MD5 hash using explicit column concatenation (stable across schema changes)
     let hash_query = format!(
         r#"
-        SELECT MD5(ROW(t.*)::TEXT) as hash
+        SELECT MD5(concat_ws('|', {})) as hash
         FROM {}.{} t
         WHERE t.{} = $1
         "#,
+        hash_columns.join(", "),
         quote_ident(source_schema),
         quote_ident(table_name),
         quote_ident(pk_column)
@@ -333,14 +340,24 @@ pub async fn check_row_hash_conflicts(
         // Get primary key column for this table
         let pk_col = get_primary_key_column(client, source_schema, &table_name).await?;
 
+        // Get hash columns for stable, deterministic hashing
+        let hash_columns = get_hash_columns(client, &table_name).await
+            .map_err(ConflictError::Database)?;
+
+        if hash_columns.is_empty() {
+            warn!(table = %table_name, "No columns found for hash computation, skipping");
+            continue;
+        }
+
         for (pk_value, captured_hash) in rows {
-            // Calculate current hash
+            // Calculate current hash using explicit column concatenation (stable across schema changes)
             let current_hash_query = format!(
                 r#"
-                SELECT MD5(ROW(t.*)::TEXT) as hash
+                SELECT MD5(concat_ws('|', {})) as hash
                 FROM {}.{} t
                 WHERE t.{}::TEXT = $1
                 "#,
+                hash_columns.join(", "),
                 quote_ident(source_schema),
                 quote_ident(&table_name),
                 quote_ident(&pk_col)
