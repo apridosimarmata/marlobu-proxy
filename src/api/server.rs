@@ -1,5 +1,7 @@
 use anyhow::Result;
 use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -18,9 +20,14 @@ use super::handlers::{
     health_check, propose_session, reject_session, AppState,
 };
 
-/// Prometheus metrics endpoint
-async fn metrics_handler() -> String {
-    metrics::export_metrics()
+/// Prometheus metrics endpoint - returns 500 if encoding fails
+async fn metrics_handler() -> Response {
+    let output = metrics::export_metrics();
+    if output.starts_with("# ERROR:") {
+        (StatusCode::INTERNAL_SERVER_ERROR, output).into_response()
+    } else {
+        output.into_response()
+    }
 }
 
 /// Build the API router with all routes
