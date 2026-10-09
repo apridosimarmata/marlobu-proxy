@@ -1,106 +1,233 @@
-# Marlobu Proxy
-
-Postgres wire protocol proxy for session-based database isolation.
-
-## Architecture
+<div align="center">
 
 ```
-Agent → Tool → Marlobu Proxy → Postgres
-                    ↓
-             Session Schema
-             (shadow tables)
+                        _       _           
+  _ __ ___   __ _ _ __ | | ___ | |__  _   _ 
+ | '_ ` _ \ / _` | '__|| |/ _ \| '_ \| | | |
+ | | | | | | (_| | |   | | (_) | |_) | |_| |
+ |_| |_| |_|\__,_|_|   |_|\___/|_.__/ \__,_|
+                                      proxy
 ```
 
-## Quick Start
+**Copy-on-write session isolation for PostgreSQL**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+</div>
+
+## Overview
+
+marlobu-proxy sits between your application and PostgreSQL, intercepting queries and routing them through isolated sessions. Within a session:
+
+- **Reads** see the original data plus any uncommitted changes
+- **Writes** go to shadow tables, leaving production data untouched
+- **Approval** atomically merges session changes into the source tables
+
+This enables workflows like data review, staging environments, and safe bulk operations—without schema changes or application modifications.
+
+## Use cases
+
+| Scenario | How marlobu helps |
+|----------|-------------------|
+| **Data review** | Analysts modify data in isolation; reviewers approve before production |
+| **Safe bulk operations** | Run large UPDATE/DELETE, verify results, then apply |
+| **Testing with production data** | Point tests at the proxy for realistic data without risk |
+| **AI agent sandboxing** | Let LLM agents query and modify data with human-in-the-loop approval |
+
+## Quick start
+
+### Prerequisites
+
+- Rust 1.75+ (for building)
+- PostgreSQL 14+
+
+### Installation
 
 ```bash
-# Start Postgres
-make postgres
-
-# Run migrations
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/marlobu make migrate
-
-# Start the proxy
-RUST_LOG=debug cargo run
+git clone https://github.com/apridosimarmata/marlobu-proxy.git
+cd marlobu-proxy
+cargo build --release
 ```
 
-## Configuration
-
-Environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PROXY_ADDR` | `0.0.0.0:5433` | Proxy listen address |
-| `API_ADDR` | `0.0.0.0:8080` | HTTP API address |
-| `DATABASE_URL` | - | Backend Postgres connection string |
-| `SESSION_TTL_SECONDS` | `3600` | Session TTL (1 hour) |
-| `WEBHOOK_URL` | - | Webhook endpoint for events |
-| `WEBHOOK_SECRET` | - | HMAC secret for webhook signatures |
-
-## Connecting
-
-Connect to the proxy like you would to Postgres:
-
-```python
-import psycopg2
-
-# Include session ID in connection params
-conn = psycopg2.connect(
-    host="localhost",
-    port=5433,
-    database="mydb",
-    user="myuser",
-    password="mypass",
-    options="-c marlobu_session=abc123"
-)
-```
-
-Or create a session via the API first:
+### Configuration
 
 ```bash
-curl -X POST http://localhost:8080/sessions \
+# Required
+export DATABASE_URL=postgres://user:pass@localhost:5432/mydb
+
+# Optional (showing defaults)
+export PROXY_ADDR=0.0.0.0:5433        # PostgreSQL wire protocol
+export API_ADDR=0.0.0.0:8080          # HTTP API
+export SESSION_TTL_SECONDS=3600       # 1 hour
+
+# Webhooks (optional)
+export WEBHOOK_URL=https://your-app.com/hooks/marlobu
+export WEBHOOK_SECRET=your-hmac-secret
+```
+
+### Run
+
+```bash
+./target/release/marlobu-proxy
+```
+
+### Basic workflow
+
+```bash
+# 1. Create a session
+SESSION_ID=$(curl -s -X POST http://localhost:8080/sessions \
   -H "Content-Type: application/json" \
-  -d '{"project_id": "my-project"}'
+  -d '{"project_id": "my-project"}' | jq -r '.id')
+
+# 2. Connect through the proxy with session context
+psql "host=localhost port=5433 dbname=mydb options='-c marlobu_session=$SESSION_ID'"
+
+# 3. Make changes (isolated to this session)
+UPDATE users SET status = 'inactive' WHERE last_login < '2024-01-01';
+
+# 4. Review what changed
+curl http://localhost:8080/sessions/$SESSION_ID/diff
+
+# 5. Apply to production
+curl -X POST http://localhost:8080/sessions/$SESSION_ID/approve
 ```
 
-## API Endpoints
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph Clients
+        A[psql / app / ORM]
+    end
+    
+    subgraph marlobu-proxy
+        B[SQL Parser] --> C[Table Rewriter]
+        C --> D[Session Manager]
+    end
+    
+    subgraph PostgreSQL
+        E[public.* tables]
+        F[session_* schemas]
+    end
+    
+    A --> B
+    D --> E
+    D --> F
+```
+
+When a session first writes to a table:
+
+1. **Shadow table** created with identical schema in `session_{id}` schema
+2. **Union view** created: source rows (minus modified PKs) + shadow rows
+3. **Reads** go through the view; **writes** go to the shadow table
+
+On approval:
+
+1. Conflict detection (concurrent modifications to same rows)
+2. Foreign key validation
+3. Atomic merge: deletes applied, shadow rows upserted
+4. Session schema dropped
+
+## API reference
+
+### Sessions
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/sessions` | Create new session |
-| GET | `/sessions/:id` | Get session details |
-| DELETE | `/sessions/:id` | Delete session |
-| POST | `/sessions/:id/propose` | Submit for review |
-| POST | `/sessions/:id/approve` | Approve and apply |
-| POST | `/sessions/:id/reject` | Reject and discard |
-| GET | `/sessions/:id/mutations` | Get staged mutations |
-| GET | `/health` | Health check |
+| `POST` | `/sessions` | Create session. Body: `{"project_id": "..."}` |
+| `GET` | `/sessions/:id` | Get session details and status |
+| `DELETE` | `/sessions/:id` | Destroy session immediately |
 
-## How It Works
+### Workflow
 
-1. **Session Start**: Creates a Postgres schema (`session_{id}`)
-2. **Reads**: Routed to views that merge shadow + prod data
-3. **Writes**: Routed to shadow tables (copy-on-write)
-4. **Propose**: Marks session for review
-5. **Approve**: Applies changes atomically with conflict detection
-6. **Reject**: Drops session schema, no changes to prod
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/sessions/:id/propose` | Submit for review (blocks further writes) |
+| `POST` | `/sessions/:id/approve` | Apply changes to source tables |
+| `POST` | `/sessions/:id/reject` | Discard all changes |
+
+### Inspection
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/sessions/:id/diff` | All changes grouped by table |
+| `GET` | `/sessions/:id/mutations` | Chronological mutation log |
+
+### Operations
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/metrics` | Prometheus metrics |
+
+## Client connection
+
+Pass the session ID via connection options:
+
+```python
+# Python (psycopg2)
+conn = psycopg2.connect(
+    host="localhost", port=5433,
+    database="mydb", user="user", password="pass",
+    options=f"-c marlobu_session={session_id}"
+)
+```
+
+```javascript
+// Node.js (pg)
+const client = new Client({
+  host: 'localhost', port: 5433,
+  database: 'mydb', user: 'user', password: 'pass',
+  options: `-c marlobu_session=${sessionId}`
+});
+```
+
+```bash
+# psql
+psql "host=localhost port=5433 dbname=mydb options='-c marlobu_session=...'"
+```
+
+## Observability
+
+Prometheus metrics at `/metrics`:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `marlobu_proxy_connections_active` | Gauge | Current connections |
+| `marlobu_queries_total` | Counter | Queries by type and status |
+| `marlobu_query_duration_seconds` | Histogram | Query latency |
+| `marlobu_sessions_total` | Counter | Sessions by status |
+| `marlobu_approvals_total` | Counter | Approvals by result |
+
+## Limitations
+
+- **No DDL**: CREATE, ALTER, DROP blocked within sessions
+- **Sequences**: Serial columns may have gaps after approval
+- **Scale**: Very large sessions (millions of rows) may be slow to approve
+- **Replication**: No support for logical replication or streaming
 
 ## Development
 
 ```bash
-# Run tests
-make test
+# Prerequisites
+make postgres          # Start local PostgreSQL
 
-# Format code
-make fmt
+# Build and test
+cargo build
+cargo test
 
 # Lint
-make lint
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 
-# Full CI check
-make ci
+# Run locally
+RUST_LOG=debug cargo run
 ```
+
+## Contributing
+
+Contributions welcome. Please open an issue first to discuss significant changes.
 
 ## License
 
-MIT
+[MIT](LICENSE)
