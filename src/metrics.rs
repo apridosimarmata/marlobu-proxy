@@ -81,6 +81,27 @@ lazy_static! {
         &["type"]  // "view", "shadow_table", "deleted_table"
     )
     .expect("failed to register INFRA_CREATED_TOTAL metric");
+
+    // Query cache metrics
+    pub static ref QUERY_CACHE_HITS: CounterVec = register_counter_vec!(
+        "marlobu_query_cache_hits_total",
+        "Total query cache hits",
+        &["schema"]
+    )
+    .expect("failed to register QUERY_CACHE_HITS metric");
+
+    pub static ref QUERY_CACHE_MISSES: CounterVec = register_counter_vec!(
+        "marlobu_query_cache_misses_total",
+        "Total query cache misses",
+        &["schema"]
+    )
+    .expect("failed to register QUERY_CACHE_MISSES metric");
+
+    pub static ref QUERY_CACHE_SIZE: Gauge = register_gauge!(
+        "marlobu_query_cache_size",
+        "Current number of cached queries"
+    )
+    .expect("failed to register QUERY_CACHE_SIZE metric");
 }
 
 /// Export metrics in Prometheus text format.

@@ -13,12 +13,16 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::metrics::{QUERY_CACHE_HITS, QUERY_CACHE_MISSES};
 use crate::proxy::protocol::{
     self, encode_backend_message, encode_error, encode_parse, encode_query, encode_startup,
     parse_backend_message, parse_frontend_message, BackendMessage, FrontendMessage, StartupMessage,
 };
-use crate::rewriter::{QueryAnalysis, QueryType, Rewriter};
+use crate::rewriter::{QueryAnalysis, QueryCache, QueryType, Rewriter};
 use crate::session::schema::SchemaManager;
+
+/// Default buffer size for connection I/O (16KB for better throughput).
+const DEFAULT_BUFFER_SIZE: usize = 16384;
 
 /// Connection state in the proxy lifecycle
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +49,8 @@ pub struct Connection {
     backend_addr: String,
     /// Database pool for infrastructure operations
     pool: Arc<Pool>,
+    /// Shared query cache
+    query_cache: Arc<QueryCache>,
     /// Schema manager for creating views/shadow tables
     schema_manager: SchemaManager,
     /// Session ID extracted from marlobu_session parameter
@@ -75,19 +81,25 @@ struct EnsuredInfra {
 
 impl Connection {
     /// Create a new connection handler
-    pub fn new(client: TcpStream, backend_addr: String, pool: Arc<Pool>) -> Self {
+    pub fn new(
+        client: TcpStream,
+        backend_addr: String,
+        pool: Arc<Pool>,
+        query_cache: Arc<QueryCache>,
+    ) -> Self {
         let schema_manager = SchemaManager::new((*pool).clone());
         Self {
             client,
             backend: None,
             backend_addr,
             pool,
+            query_cache,
             schema_manager,
             session_id: None,
             schema_name: None,
             rewriter: None,
-            client_buffer: BytesMut::with_capacity(8192),
-            backend_buffer: BytesMut::with_capacity(8192),
+            client_buffer: BytesMut::with_capacity(DEFAULT_BUFFER_SIZE),
+            backend_buffer: BytesMut::with_capacity(DEFAULT_BUFFER_SIZE),
             state: ConnectionState::Initial,
             startup_params: HashMap::new(),
             ensured_tables: HashMap::new(),
@@ -536,6 +548,24 @@ impl Connection {
 
         // If we have a rewriter (session mode), use it
         if let Some(ref rewriter) = self.rewriter {
+            let schema = self.schema_name.clone().unwrap();
+
+            // Check cache first
+            if let Some(cached) = self.query_cache.get(&schema, trimmed) {
+                QUERY_CACHE_HITS.with_label_values(&[&schema]).inc();
+                // Ensure infrastructure for cached tables
+                if let Err(e) = self
+                    .ensure_infrastructure_for_tables(&cached.table_names, &cached.write_tables)
+                    .await
+                {
+                    warn!(error = %e, "Failed to ensure infrastructure, query may fail");
+                }
+                debug!(query_type = ?cached.query_type, "Query (cached)");
+                return cached.sql;
+            }
+
+            // Parse and rewrite
+            QUERY_CACHE_MISSES.with_label_values(&[&schema]).inc();
             match rewriter.analyze(query) {
                 Ok(analysis) => {
                     // Ensure infrastructure exists for all referenced tables
@@ -543,6 +573,10 @@ impl Connection {
                         warn!(error = %e, "Failed to ensure infrastructure, query may fail");
                     }
                     debug!(query_type = ?analysis.query_type, tables = ?analysis.tables, "Query analyzed");
+
+                    // Cache the result
+                    self.query_cache.insert(&schema, trimmed, &analysis);
+
                     analysis.sql
                 }
                 Err(e) => {
@@ -555,6 +589,74 @@ impl Connection {
             // No session - pass through unchanged
             query.to_string()
         }
+    }
+
+    /// Ensure infrastructure for a list of table names (used with cached queries)
+    async fn ensure_infrastructure_for_tables(
+        &mut self,
+        table_names: &[String],
+        _write_tables: &[String],
+    ) -> anyhow::Result<()> {
+        let schema_name = match &self.schema_name {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+
+        // Collect tables that need infrastructure
+        let mut needs_view: Vec<String> = Vec::new();
+
+        for table_name in table_names {
+            let infra = self
+                .ensured_tables
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default();
+            if !infra.view {
+                needs_view.push(table_name.clone());
+            }
+        }
+
+        // Create infrastructure in parallel for better performance
+        if !needs_view.is_empty() {
+            let futures: Vec<_> = needs_view
+                .iter()
+                .map(|table_name| {
+                    let schema = schema_name.clone();
+                    let table = table_name.clone();
+                    let schema_manager = self.schema_manager.clone();
+                    let pool = self.pool.clone();
+                    let session_id = self.session_id;
+                    async move {
+                        Self::ensure_view_static(
+                            &schema_manager,
+                            &pool,
+                            &schema,
+                            &table,
+                            session_id,
+                        )
+                        .await
+                        .map(|pk| (table, pk))
+                    }
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+            for result in results {
+                match result {
+                    Ok((table_name, _pk)) => {
+                        let infra = self.ensured_tables.entry(table_name).or_default();
+                        infra.view = true;
+                        infra.shadow = true;
+                        infra.deleted = true;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create infrastructure");
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Ensure required infrastructure (views, shadow tables) exists for a query
@@ -657,6 +759,72 @@ impl Connection {
             .create_deleted_table(schema_name, "public", table_name)
             .await?;
         Ok(())
+    }
+
+    /// Ensure view exists for a table (creates shadow + deleted + view) - static version for parallel calls
+    async fn ensure_view_static(
+        schema_manager: &SchemaManager,
+        pool: &Arc<Pool>,
+        schema_name: &str,
+        table_name: &str,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<String> {
+        debug!(
+            schema = schema_name,
+            table = table_name,
+            "Ensuring view (parallel)"
+        );
+
+        // Create shadow table first
+        schema_manager
+            .create_shadow_table(schema_name, "public", table_name)
+            .await?;
+
+        // Create deleted table
+        schema_manager
+            .create_deleted_table(schema_name, "public", table_name)
+            .await?;
+
+        // Get primary key for view creation
+        let pk = schema_manager.get_primary_key("public", table_name).await?;
+
+        // Create union view
+        schema_manager
+            .create_union_view(schema_name, "public", table_name, &pk)
+            .await?;
+
+        // Update session's tables state in database so approval can find it
+        if let Some(session_id) = session_id {
+            let client = pool.get().await?;
+            let table_state = serde_json::json!({
+                "shadow_created": true,
+                "view_created": true,
+                "primary_key": pk
+            });
+
+            client
+                .execute(
+                    r#"
+                    UPDATE _marlobu_sessions
+                    SET tables = jsonb_set(
+                        COALESCE(tables, '{}'::jsonb),
+                        $2::text[],
+                        $3::jsonb
+                    )
+                    WHERE id = $1
+                    "#,
+                    &[&session_id, &vec![table_name.to_string()], &table_state],
+                )
+                .await?;
+
+            debug!(
+                session_id = %session_id,
+                table = table_name,
+                "Updated session table state in database"
+            );
+        }
+
+        Ok(pk)
     }
 
     /// Ensure view exists for a table (creates shadow + deleted + view)

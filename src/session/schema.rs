@@ -46,6 +46,7 @@ pub enum SchemaError {
 pub type SchemaResult<T> = Result<T, SchemaError>;
 
 /// Handles schema and shadow table creation
+#[derive(Clone)]
 pub struct SchemaManager {
     pool: Pool,
 }
