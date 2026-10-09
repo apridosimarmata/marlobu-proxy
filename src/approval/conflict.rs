@@ -58,7 +58,7 @@ pub async fn check_conflicts(
             schema = quote_ident(schema_name),
             table = quote_ident(&table.table_name),
             pk = quote_ident(&table.primary_key),
-            columns = table.hash_columns.join(", "),
+            columns = table.hash_columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", "),
         ), &[&table.table_name]).await?;
 
         for row in rows {
@@ -104,9 +104,9 @@ pub async fn check_conflicts(
                     WHERE table_name = $1
                 )
             "#,
-                schema = schema_name,
-                table = table.table_name,
-                pk = table.primary_key,
+                schema = quote_ident(schema_name),
+                table = quote_ident(&table.table_name),
+                pk = quote_ident(&table.primary_key),
                 pk_type = quote_ident(&table.primary_key_type),
             ), &[&table.table_name]).await?;
 
