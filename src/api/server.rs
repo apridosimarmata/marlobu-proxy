@@ -12,8 +12,8 @@ use crate::config::Config;
 use crate::session::SessionManager;
 
 use super::handlers::{
-    approve_session, create_session, delete_session, get_mutations, get_session, health_check,
-    propose_session, reject_session, AppState,
+    approve_session, create_session, delete_session, get_mutations, get_session, get_session_diff,
+    health_check, propose_session, reject_session, AppState,
 };
 
 /// Build the API router with all routes
@@ -30,6 +30,7 @@ pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
         .route("/sessions/{id}/reject", post(reject_session))
         // Session data
         .route("/sessions/{id}/mutations", get(get_mutations))
+        .route("/sessions/{id}/diff", get(get_session_diff))
         // Health
         .route("/health", get(health_check))
         // Middleware

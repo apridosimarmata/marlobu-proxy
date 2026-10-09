@@ -132,11 +132,6 @@ async fn generate_table_diff(
         quote_ident(source_schema),
         quote_ident(table_name)
     );
-    let deleted_table = format!(
-        "{}.{}",
-        quote_ident(schema_name),
-        quote_ident(&format!("_deleted_{}", table_name))
-    );
 
     // Get columns for the table (excluding _mlb_* tracking columns)
     let columns = get_table_columns(client, source_schema, table_name).await?;
@@ -165,10 +160,7 @@ async fn generate_table_diff(
     );
 
     let insert_rows = client.query(&insert_query, &[]).await?;
-    let inserts: Vec<serde_json::Value> = insert_rows
-        .iter()
-        .map(|r| r.get("data"))
-        .collect();
+    let inserts: Vec<serde_json::Value> = insert_rows.iter().map(|r| r.get("data")).collect();
 
     debug!(
         table = table_name,
@@ -280,10 +272,7 @@ async fn get_deletes(
     );
 
     let delete_rows = client.query(&delete_query, &[]).await?;
-    let deletes: Vec<serde_json::Value> = delete_rows
-        .iter()
-        .map(|r| r.get("data"))
-        .collect();
+    let deletes: Vec<serde_json::Value> = delete_rows.iter().map(|r| r.get("data")).collect();
 
     Ok(deletes)
 }
