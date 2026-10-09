@@ -190,7 +190,7 @@ impl SchemaManager {
         let create_sql = format!(
             r#"CREATE TABLE {} (
                 LIKE {} INCLUDING ALL,
-                _mlb_op VARCHAR(10) NOT NULL,
+                _mlb_op VARCHAR(10) NOT NULL DEFAULT 'WRITE',
                 _mlb_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )"#,
             shadow_table, source_table

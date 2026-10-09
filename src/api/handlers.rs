@@ -351,16 +351,63 @@ async fn apply_shadow_to_production(
     session: &Session,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut total_applied = 0;
+    let schema = &session.schema_name;
 
-    for (table_name, table_state) in &session.tables {
-        if !table_state.shadow_created {
-            continue;
-        }
+    // Discover shadow tables dynamically from the schema
+    // (proxy creates them without updating session.tables)
+    let shadow_tables: Vec<String> = client
+        .query(
+            r#"
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = $1
+              AND table_name LIKE '_shadow_%'
+            "#,
+            &[schema],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get("table_name"))
+        .collect();
 
-        let pk = &table_state.primary_key;
-        let schema = &session.schema_name;
+    info!(
+        session_id = %session.id,
+        shadow_count = shadow_tables.len(),
+        "Discovered shadow tables for approval"
+    );
 
-        // Get all columns and detect sequence-backed ones
+    for shadow_table_name in shadow_tables {
+        // Extract base table name: "_shadow_users" -> "users"
+        let table_name = shadow_table_name.strip_prefix("_shadow_").unwrap_or(&shadow_table_name);
+
+        // Get primary key from production table
+        let pk_row = client
+            .query_opt(
+                r#"
+                SELECT a.attname as column_name
+                FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                JOIN pg_class c ON c.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE i.indisprimary
+                  AND n.nspname = 'public'
+                  AND c.relname = $1
+                LIMIT 1
+                "#,
+                &[&table_name],
+            )
+            .await?;
+
+        let pk: String = match pk_row {
+            Some(row) => row.get("column_name"),
+            None => {
+                tracing::warn!(table = %table_name, "No primary key found, skipping");
+                continue;
+            }
+        };
+
+        // Get production table columns and detect sequence-backed ones
+        // Excludes _mlb_op and _mlb_ts which are shadow-only tracking columns
         let column_info: Vec<(String, bool)> = client
             .query(
                 r#"
@@ -379,21 +426,55 @@ async fn apply_shadow_to_production(
             .map(|r| (r.get("column_name"), r.get("is_sequence")))
             .collect();
 
-        let all_columns: Vec<&str> = column_info.iter().map(|(c, _)| c.as_str()).collect();
-        let is_pk_sequence = column_info.iter().any(|(c, is_seq)| c == pk && *is_seq);
+        if column_info.is_empty() {
+            tracing::warn!(table = %table_name, "No columns found in production table, skipping");
+            continue;
+        }
 
-        // Apply INSERTs (rows in shadow not in prod)
-        // If PK is sequence-backed, exclude it so Postgres assigns fresh IDs
+        let all_columns: Vec<&str> = column_info.iter().map(|(c, _)| c.as_str()).collect();
+        let is_pk_sequence = column_info.iter().any(|(c, is_seq)| c == &pk && *is_seq);
+
+        // Build column list for SELECT (excludes shadow tracking columns)
+        let col_list = all_columns
+            .iter()
+            .map(|c| format!(r#""{}""#, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Apply INSERTs (rows in shadow not yet in prod)
         if is_pk_sequence {
+            // Sequence PK: exclude PK column so Postgres assigns fresh IDs
             let insert_columns: Vec<&str> = all_columns.iter()
-                .filter(|c| *c != pk)
+                .filter(|c| *c != &pk)
                 .copied()
                 .collect();
-            let col_list = insert_columns.iter()
+            let insert_col_list = insert_columns
+                .iter()
                 .map(|c| format!(r#""{}""#, c))
                 .collect::<Vec<_>>()
                 .join(", ");
 
+            let insert_sql = format!(
+                r#"
+                INSERT INTO public."{table}" ({insert_col_list})
+                SELECT {insert_col_list} FROM "{schema}"."_shadow_{table}" s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+                )
+                "#,
+                schema = schema,
+                table = table_name,
+                pk = pk,
+                insert_col_list = insert_col_list,
+            );
+            let inserted = client.execute(&insert_sql, &[]).await?;
+            total_applied += inserted as usize;
+
+            if inserted > 0 {
+                info!(table = %table_name, count = inserted, "Inserted rows with fresh sequence IDs");
+            }
+        } else {
+            // Non-sequence PK: copy IDs directly
             let insert_sql = format!(
                 r#"
                 INSERT INTO public."{table}" ({col_list})
@@ -411,33 +492,13 @@ async fn apply_shadow_to_production(
             total_applied += inserted as usize;
 
             if inserted > 0 {
-                tracing::info!(
-                    table = %table_name,
-                    count = inserted,
-                    "Inserted rows with fresh sequence IDs"
-                );
+                info!(table = %table_name, count = inserted, "Inserted rows");
             }
-        } else {
-            // Non-sequence PK: copy IDs directly
-            let insert_sql = format!(
-                r#"
-                INSERT INTO public."{table}"
-                SELECT s.* FROM "{schema}"."_shadow_{table}" s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
-                )
-                "#,
-                schema = schema,
-                table = table_name,
-                pk = pk,
-            );
-            let inserted = client.execute(&insert_sql, &[]).await?;
-            total_applied += inserted as usize;
         }
 
-        // Apply UPDATEs (rows in both shadow and prod)
+        // Apply UPDATEs (rows in shadow that exist in prod)
         let non_pk_columns: Vec<&str> = all_columns.iter()
-            .filter(|c| *c != pk)
+            .filter(|c| *c != &pk)
             .copied()
             .collect();
 
@@ -462,9 +523,13 @@ async fn apply_shadow_to_production(
             );
             let updated = client.execute(&update_sql, &[]).await?;
             total_applied += updated as usize;
+
+            if updated > 0 {
+                info!(table = %table_name, count = updated, "Updated rows");
+            }
         }
 
-        // Apply DELETEs (check _deleted_{table} table if it exists)
+        // Apply DELETEs from _deleted_{table} if it exists
         let delete_sql = format!(
             r#"
             DELETE FROM public."{table}"
@@ -476,9 +541,11 @@ async fn apply_shadow_to_production(
             table = table_name,
             pk = pk,
         );
-        // Ignore error if _deleted table doesn't exist
         if let Ok(deleted) = client.execute(&delete_sql, &[]).await {
-            total_applied += deleted as usize;
+            if deleted > 0 {
+                info!(table = %table_name, count = deleted, "Deleted rows");
+                total_applied += deleted as usize;
+            }
         }
     }
 
