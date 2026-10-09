@@ -401,7 +401,7 @@ impl SchemaManager {
             .await?;
 
         if rows.is_empty() {
-            return Err(SchemaError::PrimaryKeyValueMismatch(format!(
+            return Err(SchemaError::PrimaryKeyNotFound(format!(
                 "{}.{}",
                 source_schema, table_name
             )));
