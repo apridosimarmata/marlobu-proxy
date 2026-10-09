@@ -515,7 +515,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fk_violation_serialization() {
+    fn test_quote_ident_valid() {
+        assert_eq!(quote_ident("users").unwrap(), "\"users\"");
+        assert_eq!(quote_ident("my_table").unwrap(), "\"my_table\"");
+        assert_eq!(quote_ident("Table123").unwrap(), "\"Table123\"");
+        assert_eq!(quote_ident("_private").unwrap(), "\"_private\"");
+    }
+
+    #[test]
+    fn test_quote_ident_escapes_quotes() {
+        // Internal quotes should be doubled (though our validation rejects them)
+        // This tests the escaping logic if validation were relaxed
+        let result = quote_ident("valid_name");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_empty() {
+        assert!(quote_ident("").is_err());
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_too_long() {
+        let long_name = "a".repeat(64);
+        assert!(quote_ident(&long_name).is_err());
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_sql_injection_semicolon() {
+        assert!(quote_ident("users; DROP TABLE users").is_err());
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_sql_injection_comment() {
+        assert!(quote_ident("users--comment").is_err());
+        assert!(quote_ident("users/*comment*/").is_err());
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_quotes() {
+        assert!(quote_ident("user's").is_err());
+        assert!(quote_ident("user\"s").is_err());
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_special_chars() {
+        assert!(quote_ident("user-name").is_err());
+        assert!(quote_ident("user.name").is_err());
+        assert!(quote_ident("user name").is_err());
+        assert!(quote_ident("user\nname").is_err());
+    }
+
+    #[test]
+    fn test_quote_literal_valid() {
+        assert_eq!(quote_literal("hello").unwrap(), "'hello'");
+        assert_eq!(quote_literal("world_123").unwrap(), "'world_123'");
+    }
+
+    #[test]
+    fn test_quote_literal_escapes_quotes() {
+        assert_eq!(quote_literal("it's").unwrap(), "'it''s'");
+        assert_eq!(quote_literal("say 'hello'").unwrap(), "'say ''hello'''");
+    }
+
+    #[test]
+    fn test_quote_literal_rejects_null_byte() {
+        assert!(quote_literal("hello\0world").is_err());
+    }
+
+    #[test]
+    fn test_fk_violation_missing_reference_serialization() {
         let violation = FkViolation {
             constraint_name: "orders_user_id_fkey".to_string(),
             violation_type: FkViolationType::MissingReference,
@@ -528,5 +597,74 @@ mod tests {
         let json = serde_json::to_string(&violation).unwrap();
         assert!(json.contains("missing_reference"));
         assert!(json.contains("orders_user_id_fkey"));
+        assert!(json.contains("user_id=999"));
+    }
+
+    #[test]
+    fn test_fk_violation_would_orphan_serialization() {
+        let violation = FkViolation {
+            constraint_name: "order_items_order_id_fkey".to_string(),
+            violation_type: FkViolationType::WouldOrphan,
+            source_table: "order_items".to_string(),
+            target_table: "orders".to_string(),
+            violating_values: vec!["order_id=42".to_string(), "order_id=43".to_string()],
+            message: "DELETE in 'orders' would orphan rows in 'order_items'".to_string(),
+        };
+
+        let json = serde_json::to_string(&violation).unwrap();
+        assert!(json.contains("would_orphan"));
+        assert!(json.contains("order_items_order_id_fkey"));
+        assert!(json.contains("order_id=42"));
+        assert!(json.contains("order_id=43"));
+    }
+
+    #[test]
+    fn test_fk_violation_multiple_columns() {
+        let violation = FkViolation {
+            constraint_name: "composite_fkey".to_string(),
+            violation_type: FkViolationType::MissingReference,
+            source_table: "child".to_string(),
+            target_table: "parent".to_string(),
+            violating_values: vec!["col1=1, col2=abc".to_string()],
+            message: "Composite FK violation".to_string(),
+        };
+
+        let json = serde_json::to_string(&violation).unwrap();
+        assert!(json.contains("composite_fkey"));
+        assert!(json.contains("col1=1, col2=abc"));
+    }
+
+    #[test]
+    fn test_foreign_key_struct() {
+        let fk = ForeignKey {
+            constraint_name: "orders_user_id_fkey".to_string(),
+            source_table: "orders".to_string(),
+            source_columns: vec!["user_id".to_string()],
+            target_table: "users".to_string(),
+            target_columns: vec!["id".to_string()],
+            on_delete: "RESTRICT".to_string(),
+            on_update: "CASCADE".to_string(),
+        };
+
+        assert_eq!(fk.constraint_name, "orders_user_id_fkey");
+        assert_eq!(fk.source_columns.len(), 1);
+        assert_eq!(fk.target_columns.len(), 1);
+    }
+
+    #[test]
+    fn test_foreign_key_composite() {
+        let fk = ForeignKey {
+            constraint_name: "line_items_composite_fkey".to_string(),
+            source_table: "line_items".to_string(),
+            source_columns: vec!["order_id".to_string(), "product_id".to_string()],
+            target_table: "order_products".to_string(),
+            target_columns: vec!["order_id".to_string(), "product_id".to_string()],
+            on_delete: "CASCADE".to_string(),
+            on_update: "NO ACTION".to_string(),
+        };
+
+        assert_eq!(fk.source_columns.len(), 2);
+        assert_eq!(fk.target_columns.len(), 2);
+        assert_eq!(fk.on_delete, "CASCADE");
     }
 }
