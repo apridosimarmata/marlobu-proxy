@@ -65,17 +65,17 @@
 *Ready for real workloads*
 
 - [x] **Connection pooling** — PgBouncer compatibility via SET marlobu.session (PR #15)
-- [ ] **Performance** — Query plan caching, view optimization
+- [x] **Performance** — Query cache (LRU), parallel infra creation, 16KB buffers (PR #19)
 - [x] **Sequence handling** — Prevent ID collisions on approval (PR #14)
 - [x] **Foreign keys** — Validate constraints at approval time (PR #15)
 - [ ] **Large objects** — BLOB/TOAST support
 - [x] **COPY protocol** — Bulk import/export (PR #16)
 - [x] **Graceful shutdown** — Drain connections, signal handling (PR #17)
-- [ ] **Observability** — Prometheus metrics, structured logging
+- [x] **Observability** — Prometheus metrics, cache hit/miss tracking (PR #18)
 
 **Exit criteria:** Can run production workload for 24h without issues.
 
-**Status:** Phase 4 in progress. Core hardening complete: PgBouncer compatibility, sequence handling, FK validation, COPY protocol, graceful shutdown. Remaining: performance optimization, large objects, observability.
+**Status:** Phase 4 nearly complete. All core hardening done: PgBouncer compatibility, query caching with LRU eviction, parallel infrastructure creation, sequence handling, FK validation, COPY protocol, graceful shutdown, Prometheus metrics. Remaining: large objects (BLOB/TOAST).
 
 ---
 

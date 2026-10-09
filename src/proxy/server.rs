@@ -8,6 +8,10 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::proxy::connection::Connection;
+use crate::rewriter::QueryCache;
+
+/// Default query cache capacity
+const DEFAULT_CACHE_CAPACITY: usize = 10000;
 
 /// Proxy server configuration
 pub struct ProxyServer {
@@ -19,6 +23,8 @@ pub struct ProxyServer {
     pool: Pool,
     /// Shutdown signal receiver
     shutdown_rx: watch::Receiver<bool>,
+    /// Shared query cache
+    query_cache: Arc<QueryCache>,
 }
 
 impl ProxyServer {
@@ -34,6 +40,7 @@ impl ProxyServer {
             backend_addr,
             pool,
             shutdown_rx,
+            query_cache: Arc::new(QueryCache::new(DEFAULT_CACHE_CAPACITY)),
         }
     }
 
@@ -44,6 +51,7 @@ impl ProxyServer {
 
         let backend_addr = Arc::new(self.backend_addr);
         let pool = Arc::new(self.pool);
+        let query_cache = self.query_cache;
         let active_connections = Arc::new(AtomicUsize::new(0));
 
         loop {
@@ -53,12 +61,13 @@ impl ProxyServer {
                         Ok((stream, peer_addr)) => {
                             let backend = Arc::clone(&backend_addr);
                             let pool = Arc::clone(&pool);
+                            let cache = Arc::clone(&query_cache);
                             let active = Arc::clone(&active_connections);
 
                             active.fetch_add(1, Ordering::SeqCst);
 
                             tokio::spawn(async move {
-                                let conn = Connection::new(stream, (*backend).clone(), pool);
+                                let conn = Connection::new(stream, (*backend).clone(), pool, cache);
                                 if let Err(e) = conn.run().await {
                                     error!(%peer_addr, error = %e, "Connection handler error");
                                 }
@@ -78,6 +87,14 @@ impl ProxyServer {
                 }
             }
         }
+
+        // Log cache stats before shutdown
+        let stats = query_cache.stats();
+        info!(
+            cached_queries = stats.len,
+            capacity = stats.cap,
+            "Query cache stats at shutdown"
+        );
 
         // Wait for active connections to drain
         let drain_timeout = std::time::Duration::from_secs(30);
