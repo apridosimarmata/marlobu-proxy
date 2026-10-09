@@ -418,11 +418,13 @@ async fn apply_shadow_to_production(
             }
         }
 
-        // Get columns from production table (shadow has extra _mlb_* columns)
-        let columns: Vec<String> = client
+        // Get columns with their default values to detect sequence-backed columns
+        let column_info: Vec<(String, bool)> = client
             .query(
                 r#"
-                SELECT column_name
+                SELECT
+                    column_name,
+                    COALESCE(column_default LIKE 'nextval%', false) as is_sequence
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND table_name = $1
@@ -432,7 +434,14 @@ async fn apply_shadow_to_production(
             )
             .await?
             .iter()
-            .map(|r| r.get("column_name"))
+            .map(|r| (r.get("column_name"), r.get("is_sequence")))
+            .collect();
+
+        let columns: Vec<String> = column_info.iter().map(|(c, _)| c.clone()).collect();
+        let sequence_columns: Vec<&String> = column_info
+            .iter()
+            .filter(|(_, is_seq)| *is_seq)
+            .map(|(c, _)| c)
             .collect();
 
         // Validate column names
@@ -442,7 +451,18 @@ async fn apply_shadow_to_production(
             }
         }
 
-        let col_list = columns.iter().map(|c| format!(r#""{}""#, c)).collect::<Vec<_>>().join(", ");
+        // For INSERTs: exclude sequence-backed columns so Postgres assigns fresh IDs
+        // This prevents ID collisions when production sequence has advanced
+        let insert_columns: Vec<&String> = columns
+            .iter()
+            .filter(|c| !sequence_columns.contains(c))
+            .collect();
+
+        let insert_col_list = insert_columns
+            .iter()
+            .map(|c| format!(r#""{}""#, c))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         // Build PK join condition for composite keys: p."col1" = s."col1" AND p."col2" = s."col2"
         let pk_join_condition = pk_columns
@@ -451,23 +471,72 @@ async fn apply_shadow_to_production(
             .collect::<Vec<_>>()
             .join(" AND ");
 
+        // For new rows detection, we need to check if the row exists in production
+        // by looking at non-sequence PK columns, or all PKs if none are sequences
+        let non_seq_pk_columns: Vec<&String> = pk_columns
+            .iter()
+            .filter(|pk| !sequence_columns.iter().any(|s| *s == *pk))
+            .collect();
+
         // Apply INSERTs (rows in shadow not in prod)
-        let insert_sql = format!(
-            r#"
-            INSERT INTO public."{table}" ({col_list})
-            SELECT {col_list} FROM "{schema}"."{shadow_table}" s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM public."{table}" p WHERE {pk_join_condition}
-            )
-            "#,
-            schema = schema,
-            table = table_name,
-            shadow_table = shadow_table,
-            pk_join_condition = pk_join_condition,
-            col_list = col_list,
-        );
-        let inserted = client.execute(&insert_sql, &[]).await?;
-        total_applied += inserted as usize;
+        // If PK is sequence-backed, we insert with fresh IDs from production sequence
+        if !sequence_columns.is_empty() && pk_columns.len() == 1 && sequence_columns.contains(&&pk_columns[0]) {
+            // Single sequence-backed PK: detect new rows by checking _mlb_is_new marker
+            // or by seeing if the shadow PK doesn't exist in production
+            // Since shadow rows copied from prod will have matching IDs, we check for
+            // rows that only exist in shadow (not copied from prod)
+
+            // Insert new rows, letting Postgres assign fresh IDs
+            let insert_sql = format!(
+                r#"
+                INSERT INTO public."{table}" ({insert_col_list})
+                SELECT {insert_col_list} FROM "{schema}"."{shadow_table}" s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+                )
+                "#,
+                schema = schema,
+                table = table_name,
+                shadow_table = shadow_table,
+                pk = pk_columns[0],
+                insert_col_list = insert_col_list,
+            );
+            let inserted = client.execute(&insert_sql, &[]).await?;
+            total_applied += inserted as usize;
+
+            if inserted > 0 {
+                tracing::info!(
+                    "Inserted {} rows into {} with fresh sequence IDs (excluded column: {})",
+                    inserted,
+                    table_name,
+                    pk_columns[0]
+                );
+            }
+        } else {
+            // Non-sequence PK or composite PK: copy IDs directly
+            let col_list = columns
+                .iter()
+                .map(|c| format!(r#""{}""#, c))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let insert_sql = format!(
+                r#"
+                INSERT INTO public."{table}" ({col_list})
+                SELECT {col_list} FROM "{schema}"."{shadow_table}" s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public."{table}" p WHERE {pk_join_condition}
+                )
+                "#,
+                schema = schema,
+                table = table_name,
+                shadow_table = shadow_table,
+                pk_join_condition = pk_join_condition,
+                col_list = col_list,
+            );
+            let inserted = client.execute(&insert_sql, &[]).await?;
+            total_applied += inserted as usize;
+        }
 
         // Apply UPDATEs (rows in both shadow and prod)
         let non_pk_columns: Vec<&String> = columns.iter().filter(|c| !pk_columns.contains(c)).collect();
