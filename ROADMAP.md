@@ -88,10 +88,13 @@
 - [x] **CONTRIBUTING.md** — Contribution guidelines (PR #20)
 - [x] **README** — Professional documentation with ASCII logo, API reference, examples (PR #22)
 - [x] **Pre-push hooks** — Local CI checks before push
-- [ ] **GitHub Release** — Tag v0.5.0, release notes
+- [x] **GitHub Release** — Tag v0.5.0, release notes
 - [ ] **Docker image** — Published to ghcr.io
+- [ ] **crates.io** — `cargo install marlobu-proxy`
+- [ ] **GitHub Release binaries** — Cross-compiled Linux/macOS/Windows via CI
+- [ ] **Homebrew tap** — `brew install marlobu-proxy`
 
-**Status:** Ready to tag v0.5.0 release.
+**Status:** v0.5.0 released. Repo is public.
 
 ---
 
