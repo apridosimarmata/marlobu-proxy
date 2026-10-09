@@ -137,7 +137,8 @@ Always explain what you did after completing a task."""
 def interactive_session():
     """Run an interactive session with the agent."""
     print("=" * 60)
-    print("Marlobu SQL Agent - Sandboxed Database Assistant")
+    print("Marlobu Playground - Sandboxed Database Assistant")
+    print("Powered by LangChain SQL Agent")
     print("=" * 60)
     print()
 
