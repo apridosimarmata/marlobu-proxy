@@ -140,7 +140,16 @@ impl SchemaManager {
 
         // Check if table already exists (another session may have created it)
         let shadow_table = format!("{}.{}", quote_ident(schema_name), quote_ident(table_name));
-        let exists = self.table_exists(&client, schema_name, table_name).await?;
+        let exists = match self.table_exists(&client, schema_name, table_name).await {
+            Ok(e) => e,
+            Err(e) => {
+                // Release lock before returning error to prevent deadlocks
+                let _ = client
+                    .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+                    .await;
+                return Err(e);
+            }
+        };
 
         if exists {
             debug!(
