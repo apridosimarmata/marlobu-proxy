@@ -13,6 +13,45 @@ pub enum FkError {
 
     #[error("Pool error: {0}")]
     Pool(#[from] deadpool_postgres::PoolError),
+
+    #[error("Invalid identifier: {0}")]
+    InvalidIdentifier(String),
+}
+
+/// Safely quote a PostgreSQL identifier to prevent SQL injection.
+/// Validates the identifier contains only safe characters and double-quotes internal quotes.
+fn quote_ident(ident: &str) -> Result<String, FkError> {
+    // Validate: PostgreSQL identifiers can contain letters, digits, underscores
+    // and must not be empty or excessively long
+    if ident.is_empty() || ident.len() > 63 {
+        return Err(FkError::InvalidIdentifier(ident.to_string()));
+    }
+
+    // Check for forbidden patterns that could indicate injection attempts
+    let forbidden = [";", "--", "/*", "*/", "'", "\\"];
+    for pattern in &forbidden {
+        if ident.contains(pattern) {
+            return Err(FkError::InvalidIdentifier(ident.to_string()));
+        }
+    }
+
+    // Only allow alphanumeric and underscore
+    if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(FkError::InvalidIdentifier(ident.to_string()));
+    }
+
+    // Double-quote the identifier (standard SQL quoting for identifiers)
+    Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
+}
+
+/// Safely format a string literal for use in SQL IN clause
+fn quote_literal(s: &str) -> Result<String, FkError> {
+    // Validate: no null bytes or other dangerous characters
+    if s.contains('\0') {
+        return Err(FkError::InvalidIdentifier(s.to_string()));
+    }
+    // Escape single quotes by doubling them
+    Ok(format!("'{}'", s.replace('\'', "''")))
 }
 
 /// A foreign key constraint definition
@@ -57,13 +96,14 @@ pub async fn get_foreign_keys(
         return Ok(Vec::new());
     }
 
-    // Build IN clause with table names directly (safely escaped)
-    let table_list: String = tables
-        .iter()
-        .map(|t| format!("'{}'", t.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Build IN clause with validated table names
+    let mut quoted_tables = Vec::new();
+    for t in tables {
+        quoted_tables.push(quote_literal(t)?);
+    }
+    let table_list = quoted_tables.join(", ");
 
+    // Schema is passed as a parameter, table names are validated literals
     let query = format!(
         r#"
         SELECT
@@ -200,17 +240,26 @@ async fn check_missing_references(
 ) -> Result<Vec<FkViolation>, FkError> {
     let mut violations = Vec::new();
 
-    // Build column references for the join condition
-    let src_cols: Vec<String> = fk
-        .source_columns
-        .iter()
-        .map(|c| format!(r#"s."{}""#, c))
-        .collect();
-    let tgt_cols: Vec<String> = fk
-        .target_columns
-        .iter()
-        .map(|c| format!(r#"t."{}""#, c))
-        .collect();
+    // Validate and quote all identifiers
+    let session_schema_q = quote_ident(session_schema)?;
+    let source_schema_q = quote_ident(source_schema)?;
+    let source_table_q = quote_ident(&fk.source_table)?;
+    let target_table_q = quote_ident(&fk.target_table)?;
+    let shadow_source_q = quote_ident(&format!("_shadow_{}", fk.source_table))?;
+    let shadow_target_q = quote_ident(&format!("_shadow_{}", fk.target_table))?;
+
+    // Build column references for the join condition (with validation)
+    let mut src_cols: Vec<String> = Vec::new();
+    for c in &fk.source_columns {
+        let col_q = quote_ident(c)?;
+        src_cols.push(format!("s.{}", col_q));
+    }
+
+    let mut tgt_cols: Vec<String> = Vec::new();
+    for c in &fk.target_columns {
+        let col_q = quote_ident(c)?;
+        tgt_cols.push(format!("t.{}", col_q));
+    }
 
     let join_conditions: Vec<String> = src_cols
         .iter()
@@ -222,28 +271,28 @@ async fn check_missing_references(
     let target_has_shadow = shadow_tables.contains(&fk.target_table);
 
     // Query: Find rows in shadow source table where FK columns don't exist in target
-    // Must check both production AND shadow (if target has changes)
     let query = if target_has_shadow {
         format!(
             r#"
             SELECT DISTINCT {src_cols_select}
-            FROM "{session_schema}"."_shadow_{source_table}" s
+            FROM {session_schema}.{shadow_source} s
             WHERE NOT EXISTS (
-                SELECT 1 FROM "{source_schema}"."{target_table}" t
+                SELECT 1 FROM {source_schema}.{target_table} t
                 WHERE {join_cond}
             )
             AND NOT EXISTS (
-                SELECT 1 FROM "{session_schema}"."_shadow_{target_table}" t
+                SELECT 1 FROM {session_schema}.{shadow_target} t
                 WHERE {join_cond}
             )
             AND ({not_null_check})
             LIMIT 10
             "#,
             src_cols_select = src_cols.join(", "),
-            session_schema = session_schema,
-            source_schema = source_schema,
-            source_table = fk.source_table,
-            target_table = fk.target_table,
+            session_schema = session_schema_q,
+            source_schema = source_schema_q,
+            shadow_source = shadow_source_q,
+            target_table = target_table_q,
+            shadow_target = shadow_target_q,
             join_cond = join_conditions.join(" AND "),
             not_null_check = src_cols
                 .iter()
@@ -255,19 +304,19 @@ async fn check_missing_references(
         format!(
             r#"
             SELECT DISTINCT {src_cols_select}
-            FROM "{session_schema}"."_shadow_{source_table}" s
+            FROM {session_schema}.{shadow_source} s
             WHERE NOT EXISTS (
-                SELECT 1 FROM "{source_schema}"."{target_table}" t
+                SELECT 1 FROM {source_schema}.{target_table} t
                 WHERE {join_cond}
             )
             AND ({not_null_check})
             LIMIT 10
             "#,
             src_cols_select = src_cols.join(", "),
-            session_schema = session_schema,
-            source_schema = source_schema,
-            source_table = fk.source_table,
-            target_table = fk.target_table,
+            session_schema = session_schema_q,
+            source_schema = source_schema_q,
+            shadow_source = shadow_source_q,
+            target_table = target_table_q,
             join_cond = join_conditions.join(" AND "),
             not_null_check = src_cols
                 .iter()
@@ -349,23 +398,40 @@ async fn check_orphaned_references(
         return Ok(violations);
     }
 
-    // Build join conditions
-    let src_cols: Vec<String> = fk
-        .source_columns
-        .iter()
-        .map(|c| format!(r#"src."{}""#, c))
-        .collect();
-    let del_cols: Vec<String> = fk
-        .target_columns
-        .iter()
-        .map(|c| format!(r#"del."{}""#, c))
-        .collect();
+    // Validate and quote all identifiers
+    let session_schema_q = quote_ident(session_schema)?;
+    let source_schema_q = quote_ident(source_schema)?;
+    let source_table_q = quote_ident(&fk.source_table)?;
+    let target_table_q = quote_ident(&fk.target_table)?;
+    let deleted_target_q = quote_ident(&format!("_deleted_{}", fk.target_table))?;
+    let deleted_source_q = quote_ident(&format!("_deleted_{}", fk.source_table))?;
+
+    // Build column references with validation
+    let mut src_cols: Vec<String> = Vec::new();
+    for c in &fk.source_columns {
+        let col_q = quote_ident(c)?;
+        src_cols.push(format!("src.{}", col_q));
+    }
+
+    let mut del_cols: Vec<String> = Vec::new();
+    for c in &fk.target_columns {
+        let col_q = quote_ident(c)?;
+        del_cols.push(format!("del.{}", col_q));
+    }
 
     let join_conditions: Vec<String> = src_cols
         .iter()
         .zip(del_cols.iter())
         .map(|(s, d)| format!("{} = {}", s, d))
         .collect();
+
+    // Build src_del join condition with validation
+    let mut src_del_cond_parts: Vec<String> = Vec::new();
+    for c in &fk.source_columns {
+        let col_q = quote_ident(c)?;
+        src_del_cond_parts.push(format!("src.{} = src_del.{}", col_q, col_q));
+    }
+    let src_del_cond = src_del_cond_parts.join(" AND ");
 
     // Check if source table also has shadow changes (might have corresponding deletes)
     let source_has_shadow = shadow_tables.contains(&fk.source_table);
@@ -376,47 +442,36 @@ async fn check_orphaned_references(
         format!(
             r#"
             SELECT DISTINCT {src_cols_select}
-            FROM "{source_schema}"."{source_table}" src
-            JOIN "{session_schema}"."_deleted_{target_table}" del ON {join_cond}
+            FROM {source_schema}.{source_table} src
+            JOIN {session_schema}.{deleted_target} del ON {join_cond}
             WHERE NOT EXISTS (
-                SELECT 1 FROM "{session_schema}"."_deleted_{source_table}" src_del
+                SELECT 1 FROM {session_schema}.{deleted_source} src_del
                 WHERE {src_del_cond}
             )
             LIMIT 10
             "#,
-            src_cols_select = fk.source_columns
-                .iter()
-                .map(|c| format!(r#"src."{}""#, c))
-                .collect::<Vec<_>>()
-                .join(", "),
-            source_schema = source_schema,
-            session_schema = session_schema,
-            source_table = fk.source_table,
-            target_table = fk.target_table,
+            src_cols_select = src_cols.join(", "),
+            source_schema = source_schema_q,
+            session_schema = session_schema_q,
+            source_table = source_table_q,
+            deleted_target = deleted_target_q,
+            deleted_source = deleted_source_q,
             join_cond = join_conditions.join(" AND "),
-            src_del_cond = fk.source_columns
-                .iter()
-                .map(|c| format!(r#"src."{c}" = src_del."{c}""#, c = c))
-                .collect::<Vec<_>>()
-                .join(" AND "),
+            src_del_cond = src_del_cond,
         )
     } else {
         format!(
             r#"
             SELECT DISTINCT {src_cols_select}
-            FROM "{source_schema}"."{source_table}" src
-            JOIN "{session_schema}"."_deleted_{target_table}" del ON {join_cond}
+            FROM {source_schema}.{source_table} src
+            JOIN {session_schema}.{deleted_target} del ON {join_cond}
             LIMIT 10
             "#,
-            src_cols_select = fk.source_columns
-                .iter()
-                .map(|c| format!(r#"src."{}""#, c))
-                .collect::<Vec<_>>()
-                .join(", "),
-            source_schema = source_schema,
-            session_schema = session_schema,
-            source_table = fk.source_table,
-            target_table = fk.target_table,
+            src_cols_select = src_cols.join(", "),
+            source_schema = source_schema_q,
+            session_schema = session_schema_q,
+            source_table = source_table_q,
+            deleted_target = deleted_target_q,
             join_cond = join_conditions.join(" AND "),
         )
     };
