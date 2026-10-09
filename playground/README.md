@@ -1,6 +1,8 @@
-# Marlobu Playground - LangChain SQL Agent
+# Marlobu Playground
 
 AI-powered database assistant with sandboxed operations. All changes are isolated until you approve them.
+
+**Powered by [LangChain](https://langchain.com) SQL Agent**
 
 ## Setup
 
