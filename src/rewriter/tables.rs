@@ -14,6 +14,8 @@ pub enum RewriteContext {
     Read,
     /// Writing data - route to view (INSTEAD OF triggers handle copy-on-write)
     Write,
+    /// Direct write to shadow (for COPY which bypasses triggers)
+    DirectWrite,
 }
 
 /// Rewrites a table name for the given schema and context.
@@ -25,12 +27,16 @@ pub enum RewriteContext {
 pub fn rewrite_table_name(
     table: &ObjectName,
     schema: &str,
-    _context: RewriteContext,
+    context: RewriteContext,
 ) -> ObjectName {
     let table_name = extract_table_name(table);
 
-    // All operations go through the view - INSTEAD OF triggers route writes to shadow
-    let rewritten_name = format!("_view_{}", table_name);
+    // DirectWrite goes to shadow table (for COPY which bypasses triggers)
+    // All other operations go through the view
+    let rewritten_name = match context {
+        RewriteContext::DirectWrite => format!("_shadow_{}", table_name),
+        _ => format!("_view_{}", table_name),
+    };
 
     ObjectName(vec![
         Ident::new(schema),
@@ -77,7 +83,7 @@ pub fn view_name_for_table(table: &str) -> String {
 
 /// Creates a shadow table name for a table.
 pub fn shadow_name_for_table(table: &str) -> String {
-    format!("_view_{}", table)
+    format!("_shadow_{}", table)
 }
 
 #[cfg(test)]
