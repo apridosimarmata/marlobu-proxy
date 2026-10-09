@@ -95,9 +95,8 @@ pub fn export_metrics() -> String {
         return format!("# ERROR: failed to encode metrics: {}\n", e);
     }
 
-    String::from_utf8(buffer).unwrap_or_else(|e| {
-        format!("# ERROR: metrics contained invalid UTF-8: {}\n", e)
-    })
+    String::from_utf8(buffer)
+        .unwrap_or_else(|e| format!("# ERROR: metrics contained invalid UTF-8: {}\n", e))
 }
 
 #[cfg(test)]
