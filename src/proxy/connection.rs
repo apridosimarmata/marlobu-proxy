@@ -478,24 +478,51 @@ impl Connection {
         }
 
         // Second pass: create infrastructure (no borrows held)
+        // Mark as ensured BEFORE async calls to prevent race conditions
         for table_name in needs_view {
-            self.ensure_view(&schema_name, &table_name).await?;
-            let infra = self.ensured_tables.entry(table_name).or_default();
-            infra.view = true;
-            infra.shadow = true;
-            infra.deleted = true;
+            // Mark intent first
+            {
+                let infra = self.ensured_tables.entry(table_name.clone()).or_default();
+                infra.view = true;
+                infra.shadow = true;
+                infra.deleted = true;
+            }
+            // Then create (schema manager uses advisory locks for safety)
+            if let Err(e) = self.ensure_view(&schema_name, &table_name).await {
+                // Rollback on failure
+                if let Some(infra) = self.ensured_tables.get_mut(&table_name) {
+                    infra.view = false;
+                    infra.shadow = false;
+                    infra.deleted = false;
+                }
+                return Err(e);
+            }
         }
 
         for table_name in needs_shadow {
-            self.ensure_shadow(&schema_name, &table_name).await?;
-            let infra = self.ensured_tables.entry(table_name).or_default();
-            infra.shadow = true;
+            {
+                let infra = self.ensured_tables.entry(table_name.clone()).or_default();
+                infra.shadow = true;
+            }
+            if let Err(e) = self.ensure_shadow(&schema_name, &table_name).await {
+                if let Some(infra) = self.ensured_tables.get_mut(&table_name) {
+                    infra.shadow = false;
+                }
+                return Err(e);
+            }
         }
 
         for table_name in needs_deleted {
-            self.ensure_deleted(&schema_name, &table_name).await?;
-            let infra = self.ensured_tables.entry(table_name).or_default();
-            infra.deleted = true;
+            {
+                let infra = self.ensured_tables.entry(table_name.clone()).or_default();
+                infra.deleted = true;
+            }
+            if let Err(e) = self.ensure_deleted(&schema_name, &table_name).await {
+                if let Some(infra) = self.ensured_tables.get_mut(&table_name) {
+                    infra.deleted = false;
+                }
+                return Err(e);
+            }
         }
 
         Ok(())
