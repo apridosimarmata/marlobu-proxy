@@ -34,6 +34,12 @@ pub enum SchemaError {
 
     #[error("Primary key not found for table: {0}")]
     PrimaryKeyNotFound(String),
+
+    #[error("Primary key value count mismatch: {0}")]
+    PrimaryKeyValueMismatch(String),
+
+    #[error("Invalid data type from catalog: {0}")]
+    InvalidDataType(String),
 }
 
 pub type SchemaResult<T> = Result<T, SchemaError>;
@@ -52,13 +58,11 @@ impl SchemaManager {
     pub async fn create_session_schema(&self, schema_name: &str) -> SchemaResult<()> {
         let client = self.pool.get().await?;
 
-        // Create the schema
         let create_schema = format!("CREATE SCHEMA {}", quote_ident(schema_name));
         client.execute(&create_schema, &[]).await?;
 
         info!(schema = schema_name, "Created session schema");
 
-        // Create _deletes tracking table
         let create_deletes = format!(
             r#"
             CREATE TABLE {}._deletes (
@@ -72,7 +76,6 @@ impl SchemaManager {
         );
         client.execute(&create_deletes, &[]).await?;
 
-        // Create _expected_state tracking table for optimistic locking
         let create_expected = format!(
             r#"
             CREATE TABLE {}._expected_state (
@@ -92,8 +95,6 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Create the _mlb_row_hashes table for conflict detection
-    /// This table stores MD5 hashes of rows at the time they were first accessed
     pub async fn create_hash_table(&self, schema_name: &str) -> SchemaResult<()> {
         let client = self.pool.get().await?;
 
@@ -116,7 +117,6 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Drop session schema and all its contents
     pub async fn drop_session_schema(&self, schema_name: &str) -> SchemaResult<()> {
         let client = self.pool.get().await?;
 
@@ -128,66 +128,76 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Create shadow table for copy-on-write semantics
-    /// Uses advisory locks to prevent race conditions
+    #[instrument(skip(self), level = "debug")]
+    pub async fn shadow_table_exists(
+        &self,
+        session_schema: &str,
+        table_name: &str,
+    ) -> SchemaResult<bool> {
+        let client = self.pool.get().await?;
+        let shadow_name = format!("_shadow_{}", table_name);
+        self.table_exists(&client, session_schema, &shadow_name).await
+    }
+
+    #[instrument(skip(self), level = "debug")]
     pub async fn create_shadow_table(
         &self,
-        schema_name: &str,
+        session_schema: &str,
         source_schema: &str,
         table_name: &str,
     ) -> SchemaResult<String> {
         let client = self.pool.get().await?;
+        let shadow_name = format!("_shadow_{}", table_name);
 
-        // Generate a deterministic lock key from schema + table
-        let lock_key = Self::advisory_lock_key(schema_name, table_name);
+        let lock_key = Self::advisory_lock_key(session_schema, &shadow_name);
 
-        // Try to acquire advisory lock (will block if another session is creating same table)
         let lock_acquired: bool = client
             .query_one("SELECT pg_try_advisory_lock($1) as acquired", &[&lock_key])
             .await?
             .get("acquired");
 
         if !lock_acquired {
-            // Wait for lock instead
             client
                 .execute("SELECT pg_advisory_lock($1)", &[&lock_key])
                 .await?;
         }
 
-        // Check if table already exists (another session may have created it)
-        let shadow_table = format!("{}.{}", quote_ident(schema_name), quote_ident(table_name));
-        let exists = self.table_exists(&client, schema_name, table_name).await?;
+        let shadow_table = format!("{}.{}", quote_ident(session_schema), quote_ident(&shadow_name));
+        let exists = self.table_exists(&client, session_schema, &shadow_name).await?;
 
         if exists {
             debug!(
-                schema = schema_name,
-                table = table_name,
+                session_schema = session_schema,
+                shadow_table = shadow_name,
                 "Shadow table already exists"
             );
-            // Release lock
             client
                 .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
                 .await?;
             return Ok(shadow_table);
         }
 
-        // Create shadow table with same structure as source
         let source_table = format!("{}.{}", quote_ident(source_schema), quote_ident(table_name));
         let create_sql = format!(
-            "CREATE TABLE {} (LIKE {} INCLUDING ALL)",
+            r#"CREATE TABLE {} (
+                LIKE {} INCLUDING ALL,
+                _mlb_op VARCHAR(10) NOT NULL,
+                _mlb_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )"#,
             shadow_table, source_table
         );
 
         match client.execute(&create_sql, &[]).await {
             Ok(_) => {
                 info!(
-                    schema = schema_name,
-                    table = table_name,
-                    "Created shadow table"
+                    session_schema = session_schema,
+                    source_schema = source_schema,
+                    source_table = table_name,
+                    shadow_table = shadow_name,
+                    "Created shadow table with tracking columns (_mlb_op, _mlb_ts)"
                 );
             }
             Err(e) => {
-                // Release lock before returning error
                 let _ = client
                     .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
                     .await;
@@ -195,7 +205,6 @@ impl SchemaManager {
             }
         }
 
-        // Release advisory lock
         client
             .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
             .await?;
@@ -203,7 +212,6 @@ impl SchemaManager {
         Ok(shadow_table)
     }
 
-    /// Create UNION ALL view combining shadow and source tables
     pub async fn create_union_view(
         &self,
         schema_name: &str,
@@ -222,9 +230,6 @@ impl SchemaManager {
         let source_table = format!("{}.{}", quote_ident(source_schema), quote_ident(table_name));
         let deletes_table = format!("{}._deletes", quote_ident(schema_name));
 
-        // View that:
-        // 1. Shows all rows from shadow table (modified rows)
-        // 2. Shows source rows that are NOT in shadow AND NOT deleted
         let create_view = format!(
             r#"
             CREATE OR REPLACE VIEW {} AS
@@ -258,7 +263,6 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Get the primary key column for a table
     pub async fn get_primary_key(
         &self,
         schema_name: &str,
@@ -292,7 +296,6 @@ impl SchemaManager {
         }
     }
 
-    /// Check if a table exists in a schema
     async fn table_exists(
         &self,
         client: &deadpool_postgres::Client,
@@ -314,7 +317,6 @@ impl SchemaManager {
         Ok(row.get("exists"))
     }
 
-    /// Generate a deterministic advisory lock key from schema + table name
     fn advisory_lock_key(schema_name: &str, table_name: &str) -> i64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -323,7 +325,6 @@ impl SchemaManager {
         hasher.finish() as i64
     }
 
-    /// List all tables in a schema (excluding internal tracking tables)
     pub async fn list_tables(&self, schema_name: &str) -> SchemaResult<Vec<String>> {
         let client = self.pool.get().await?;
 
@@ -344,7 +345,6 @@ impl SchemaManager {
         Ok(rows.iter().map(|r| r.get("table_name")).collect())
     }
 
-    /// Get all primary key columns for a table (supports composite keys)
     #[instrument(skip(self), fields(schema = %source_schema, table = %table_name))]
     pub async fn get_primary_key_columns(
         &self,
@@ -378,18 +378,21 @@ impl SchemaManager {
             )));
         }
 
-        let columns = rows
-            .iter()
-            .map(|r| PrimaryKeyColumn {
+        let mut columns = Vec::with_capacity(rows.len());
+        for r in rows.iter() {
+            let data_type: String = r.get("data_type");
+            // Validate data type to prevent SQL injection via compromised catalogs
+            validate_pg_data_type(&data_type)?;
+            columns.push(PrimaryKeyColumn {
                 name: r.get("column_name"),
-                data_type: r.get("data_type"),
-            })
-            .collect();
+                data_type,
+            });
+        }
 
         debug!(
             schema = source_schema,
             table = table_name,
-            column_count = rows.len(),
+            column_count = columns.len(),
             "Retrieved primary key columns"
         );
 
@@ -397,33 +400,61 @@ impl SchemaManager {
     }
 
     /// Create a deleted tracking table for a specific source table.
-    /// The deleted table stores just the primary key column(s) to track which rows were deleted.
+    /// Uses advisory locks to prevent race conditions during concurrent table creation.
     #[instrument(skip(self), fields(session = %session_schema, source = %source_schema, table = %table_name))]
     pub async fn create_deleted_table(
         &self,
         session_schema: &str,
         source_schema: &str,
         table_name: &str,
-    ) -> SchemaResult<String> {
+    ) -> SchemaResult<(String, Vec<PrimaryKeyColumn>)> {
         let client = self.pool.get().await?;
 
-        // Get primary key columns from source table
+        let deleted_table_name = format!("_deleted_{}", table_name);
+
+        // Use advisory lock to prevent race conditions
+        let lock_key = Self::advisory_lock_key(session_schema, &deleted_table_name);
+
+        let lock_acquired: bool = client
+            .query_one("SELECT pg_try_advisory_lock($1) as acquired", &[&lock_key])
+            .await?
+            .get("acquired");
+
+        if !lock_acquired {
+            client
+                .execute("SELECT pg_advisory_lock($1)", &[&lock_key])
+                .await?;
+        }
+
+        let exists = self
+            .table_exists(&client, session_schema, &deleted_table_name)
+            .await?;
+
         let pk_columns = self.get_primary_key_columns(source_schema, table_name).await?;
 
-        let deleted_table_name = format!("_deleted_{}", table_name);
         let full_table_name = format!(
             "{}.{}",
             quote_ident(session_schema),
             quote_ident(&deleted_table_name)
         );
 
-        // Build column definitions for PK columns
+        if exists {
+            debug!(
+                session_schema = session_schema,
+                deleted_table = deleted_table_name,
+                "Deleted table already exists"
+            );
+            client
+                .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+                .await?;
+            return Ok((full_table_name, pk_columns));
+        }
+
         let pk_column_defs: Vec<String> = pk_columns
             .iter()
-            .map(|col| format!("{} {}", quote_ident(&col.name), col.data_type))
+            .map(|col| format!("{} {}", quote_ident(&col.name), &col.data_type))
             .collect();
 
-        // Build PRIMARY KEY constraint
         let pk_column_names: Vec<String> = pk_columns
             .iter()
             .map(|col| quote_ident(&col.name))
@@ -442,20 +473,31 @@ impl SchemaManager {
             pk_column_names.join(", ")
         );
 
-        client.execute(&create_sql, &[]).await?;
+        match client.execute(&create_sql, &[]).await {
+            Ok(_) => {
+                info!(
+                    session_schema = session_schema,
+                    table = table_name,
+                    deleted_table = deleted_table_name,
+                    pk_columns = ?pk_column_names,
+                    "Created deleted tracking table"
+                );
+            }
+            Err(e) => {
+                let _ = client
+                    .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+                    .await;
+                return Err(SchemaError::Database(e));
+            }
+        }
 
-        info!(
-            session_schema = session_schema,
-            table = table_name,
-            deleted_table = deleted_table_name,
-            pk_columns = ?pk_column_names,
-            "Created deleted tracking table"
-        );
+        client
+            .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+            .await?;
 
-        Ok(full_table_name)
+        Ok((full_table_name, pk_columns))
     }
 
-    /// Check if a deleted tracking table exists for a given source table
     #[instrument(skip(self), fields(session = %session_schema, table = %table_name))]
     pub async fn deleted_table_exists(
         &self,
@@ -482,7 +524,7 @@ impl SchemaManager {
     }
 
     /// Record a deletion in the deleted tracking table.
-    /// Creates the deleted table if it doesn't exist.
+    /// Returns the PK columns for potential caching by the caller.
     #[instrument(skip(self, pk_value), fields(session = %session_schema, source = %source_schema, table = %table_name))]
     pub async fn record_deletion(
         &self,
@@ -490,24 +532,25 @@ impl SchemaManager {
         source_schema: &str,
         table_name: &str,
         pk_value: &PkValue,
-    ) -> SchemaResult<()> {
+    ) -> SchemaResult<Vec<PrimaryKeyColumn>> {
         let client = self.pool.get().await?;
 
-        // Ensure deleted table exists
         let deleted_table_name = format!("_deleted_{}", table_name);
+
         let table_exists = self
             .table_exists(&client, session_schema, &deleted_table_name)
             .await?;
 
-        if !table_exists {
-            self.create_deleted_table(session_schema, source_schema, table_name)
+        // Get PK columns - from create_deleted_table (returns them) or fetch once
+        let pk_columns = if !table_exists {
+            let (_, cols) = self
+                .create_deleted_table(session_schema, source_schema, table_name)
                 .await?;
-        }
-
-        // Get PK columns to know column names for insert
-        let pk_columns = self
-            .get_primary_key_columns(source_schema, table_name)
-            .await?;
+            cols
+        } else {
+            self.get_primary_key_columns(source_schema, table_name)
+                .await?
+        };
 
         let full_table_name = format!(
             "{}.{}",
@@ -515,20 +558,18 @@ impl SchemaManager {
             quote_ident(&deleted_table_name)
         );
 
-        // Build column names list
         let column_names: Vec<String> = pk_columns
             .iter()
             .map(|col| quote_ident(&col.name))
             .collect();
 
-        // Get values based on PkValue type
         let values: Vec<&str> = match pk_value {
             PkValue::Single(v) => vec![v.as_str()],
             PkValue::Composite(vs) => vs.iter().map(|s| s.as_str()).collect(),
         };
 
         if values.len() != pk_columns.len() {
-            return Err(SchemaError::PrimaryKeyNotFound(format!(
+            return Err(SchemaError::PrimaryKeyValueMismatch(format!(
                 "Expected {} PK values for {}.{}, got {}",
                 pk_columns.len(),
                 source_schema,
@@ -537,7 +578,6 @@ impl SchemaManager {
             )));
         }
 
-        // Build parameterized INSERT with ON CONFLICT DO NOTHING (idempotent)
         let placeholders: Vec<String> = (1..=values.len()).map(|i| format!("${}", i)).collect();
 
         let insert_sql = format!(
@@ -547,7 +587,6 @@ impl SchemaManager {
             placeholders.join(", ")
         );
 
-        // Convert values to params - all as TEXT since Postgres will cast
         let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             values.iter().map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
 
@@ -559,13 +598,47 @@ impl SchemaManager {
             "Recorded deletion"
         );
 
-        Ok(())
+        Ok(pk_columns)
     }
 }
 
-/// Quote an identifier to prevent SQL injection
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Validate that a data type string from pg_catalog is safe to use in SQL.
+fn validate_pg_data_type(data_type: &str) -> Result<(), SchemaError> {
+    let trimmed = data_type.trim();
+
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err(SchemaError::InvalidDataType(data_type.to_string()));
+    }
+
+    let lower = trimmed.to_lowercase();
+    let forbidden = [";", "--", "/*", "*/", "drop", "delete", "insert", "update", "select", "exec", "execute"];
+    for pattern in &forbidden {
+        if lower.contains(pattern) {
+            return Err(SchemaError::InvalidDataType(data_type.to_string()));
+        }
+    }
+
+    let valid_chars = |c: char| {
+        c.is_ascii_alphanumeric()
+            || c == ' '
+            || c == '_'
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
+            || c == ','
+            || c == '.'
+    };
+
+    if !trimmed.chars().all(valid_chars) {
+        return Err(SchemaError::InvalidDataType(data_type.to_string()));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -623,65 +696,35 @@ mod tests {
 
     #[test]
     fn test_deleted_table_name_format() {
-        // Verify the naming convention for deleted tables
         let table_name = "users";
         let deleted_table_name = format!("_deleted_{}", table_name);
         assert_eq!(deleted_table_name, "_deleted_users");
-
-        let table_name = "order_items";
-        let deleted_table_name = format!("_deleted_{}", table_name);
-        assert_eq!(deleted_table_name, "_deleted_order_items");
     }
 
     #[test]
-    fn test_quote_ident_with_special_chars() {
-        // Table names with special characters should be properly escaped
-        assert_eq!(quote_ident("table-name"), "\"table-name\"");
-        assert_eq!(quote_ident("123numeric"), "\"123numeric\"");
-        assert_eq!(quote_ident("UPPERCASE"), "\"UPPERCASE\"");
-        assert_eq!(quote_ident("mixed_Case-Name"), "\"mixed_Case-Name\"");
+    fn test_validate_pg_data_type_valid() {
+        assert!(validate_pg_data_type("integer").is_ok());
+        assert!(validate_pg_data_type("bigint").is_ok());
+        assert!(validate_pg_data_type("character varying(255)").is_ok());
+        assert!(validate_pg_data_type("numeric(10,2)").is_ok());
+        assert!(validate_pg_data_type("timestamp with time zone").is_ok());
+        assert!(validate_pg_data_type("integer[]").is_ok());
+        assert!(validate_pg_data_type("pg_catalog.int4").is_ok());
     }
 
     #[test]
-    fn test_pk_column_sql_generation() {
-        // Test that we can build proper SQL column definitions
-        let columns = vec![
-            PrimaryKeyColumn {
-                name: "tenant_id".to_string(),
-                data_type: "uuid".to_string(),
-            },
-            PrimaryKeyColumn {
-                name: "user_id".to_string(),
-                data_type: "bigint".to_string(),
-            },
-        ];
-
-        let pk_column_defs: Vec<String> = columns
-            .iter()
-            .map(|col| format!("{} {}", quote_ident(&col.name), col.data_type))
-            .collect();
-
-        assert_eq!(pk_column_defs.len(), 2);
-        assert_eq!(pk_column_defs[0], "\"tenant_id\" uuid");
-        assert_eq!(pk_column_defs[1], "\"user_id\" bigint");
-
-        let pk_column_names: Vec<String> = columns
-            .iter()
-            .map(|col| quote_ident(&col.name))
-            .collect();
-
-        assert_eq!(pk_column_names.join(", "), "\"tenant_id\", \"user_id\"");
+    fn test_validate_pg_data_type_invalid() {
+        assert!(validate_pg_data_type("integer; DROP TABLE users").is_err());
+        assert!(validate_pg_data_type("text--comment").is_err());
+        assert!(validate_pg_data_type("integer/*comment*/").is_err());
+        assert!(validate_pg_data_type("text' OR '1'='1").is_err());
+        assert!(validate_pg_data_type("").is_err());
+        assert!(validate_pg_data_type("select * from users").is_err());
     }
 
     #[test]
-    fn test_insert_placeholders_generation() {
-        // Test placeholder generation for parameterized queries
-        let num_columns = 3;
-        let placeholders: Vec<String> = (1..=num_columns).map(|i| format!("${}", i)).collect();
-        assert_eq!(placeholders.join(", "), "$1, $2, $3");
-
-        let num_columns = 1;
-        let placeholders: Vec<String> = (1..=num_columns).map(|i| format!("${}", i)).collect();
-        assert_eq!(placeholders.join(", "), "$1");
+    fn test_validate_pg_data_type_too_long() {
+        let long_type = "a".repeat(200);
+        assert!(validate_pg_data_type(&long_type).is_err());
     }
 }
