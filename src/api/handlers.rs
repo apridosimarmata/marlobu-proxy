@@ -353,6 +353,15 @@ async fn apply_shadow_to_production(
     let mut total_applied = 0;
     let schema = session.schema_name.clone();
 
+    // Validate identifier to prevent SQL injection
+    fn is_valid_identifier(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    }
+
+    if !is_valid_identifier(&schema) {
+        return Err(format!("Invalid schema name: {}", schema).into());
+    }
+
     // Query actual shadow tables from the schema (more reliable than cached session.tables)
     let shadow_tables: Vec<(String, String)> = client
         .query(
@@ -372,9 +381,14 @@ async fn apply_shadow_to_production(
         .collect();
 
     for (table_name, shadow_table) in shadow_tables {
-        // Get primary key for this table (same approach as conflict checker)
-        let pk: String = client
-            .query_one(
+        // Validate identifiers
+        if !is_valid_identifier(&table_name) || !is_valid_identifier(&shadow_table) {
+            return Err(format!("Invalid table name: {} / {}", table_name, shadow_table).into());
+        }
+
+        // Get ALL primary key columns (supports composite PKs)
+        let pk_columns: Vec<String> = client
+            .query(
                 r#"
                 SELECT a.attname
                 FROM pg_index i
@@ -384,11 +398,25 @@ async fn apply_shadow_to_production(
                 WHERE i.indisprimary
                   AND n.nspname = 'public'
                   AND c.relname = $1
+                ORDER BY array_position(i.indkey, a.attnum)
                 "#,
                 &[&table_name],
             )
             .await?
-            .get("attname");
+            .iter()
+            .map(|r| r.get("attname"))
+            .collect();
+
+        if pk_columns.is_empty() {
+            return Err(format!("No primary key found for table: {}", table_name).into());
+        }
+
+        // Validate PK column names
+        for pk in &pk_columns {
+            if !is_valid_identifier(pk) {
+                return Err(format!("Invalid primary key column: {}", pk).into());
+            }
+        }
 
         // Get columns from production table (shadow has extra _mlb_* columns)
         let columns: Vec<String> = client
@@ -407,7 +435,21 @@ async fn apply_shadow_to_production(
             .map(|r| r.get("column_name"))
             .collect();
 
+        // Validate column names
+        for col in &columns {
+            if !is_valid_identifier(col) {
+                return Err(format!("Invalid column name: {}", col).into());
+            }
+        }
+
         let col_list = columns.iter().map(|c| format!(r#""{}""#, c)).collect::<Vec<_>>().join(", ");
+
+        // Build PK join condition for composite keys: p."col1" = s."col1" AND p."col2" = s."col2"
+        let pk_join_condition = pk_columns
+            .iter()
+            .map(|pk| format!(r#"p."{pk}" = s."{pk}""#))
+            .collect::<Vec<_>>()
+            .join(" AND ");
 
         // Apply INSERTs (rows in shadow not in prod)
         let insert_sql = format!(
@@ -415,20 +457,20 @@ async fn apply_shadow_to_production(
             INSERT INTO public."{table}" ({col_list})
             SELECT {col_list} FROM "{schema}"."{shadow_table}" s
             WHERE NOT EXISTS (
-                SELECT 1 FROM public."{table}" p WHERE p."{pk}" = s."{pk}"
+                SELECT 1 FROM public."{table}" p WHERE {pk_join_condition}
             )
             "#,
             schema = schema,
             table = table_name,
             shadow_table = shadow_table,
-            pk = pk,
+            pk_join_condition = pk_join_condition,
             col_list = col_list,
         );
         let inserted = client.execute(&insert_sql, &[]).await?;
         total_applied += inserted as usize;
 
         // Apply UPDATEs (rows in both shadow and prod)
-        let non_pk_columns: Vec<&String> = columns.iter().filter(|c| c.as_str() != pk).collect();
+        let non_pk_columns: Vec<&String> = columns.iter().filter(|c| !pk_columns.contains(c)).collect();
 
         if !non_pk_columns.is_empty() {
             let set_clause = non_pk_columns
@@ -442,12 +484,12 @@ async fn apply_shadow_to_production(
                 UPDATE public."{table}" p
                 SET {set_clause}
                 FROM "{schema}"."{shadow_table}" s
-                WHERE p."{pk}" = s."{pk}"
+                WHERE {pk_join_condition}
                 "#,
                 schema = schema,
                 table = table_name,
                 shadow_table = shadow_table,
-                pk = pk,
+                pk_join_condition = pk_join_condition,
                 set_clause = set_clause,
             );
             let updated = client.execute(&update_sql, &[]).await?;
@@ -455,19 +497,44 @@ async fn apply_shadow_to_production(
         }
 
         // Apply DELETEs (check _deleted_{table} table)
+        // For composite PKs, pk_value stores JSON: {"col1": val1, "col2": val2}
         let deleted_table = format!("_deleted_{}", table_name);
-        let delete_sql = format!(
-            r#"
-            DELETE FROM public."{table}"
-            WHERE "{pk}"::text IN (
-                SELECT pk_value FROM "{schema}"."{deleted_table}"
+
+        let delete_sql = if pk_columns.len() == 1 {
+            // Simple single-column PK
+            let pk = &pk_columns[0];
+            format!(
+                r#"
+                DELETE FROM public."{table}"
+                WHERE "{pk}"::text IN (
+                    SELECT pk_value FROM "{schema}"."{deleted_table}"
+                )
+                "#,
+                schema = schema,
+                table = table_name,
+                deleted_table = deleted_table,
+                pk = pk,
             )
-            "#,
-            schema = schema,
-            table = table_name,
-            deleted_table = deleted_table,
-            pk = pk,
-        );
+        } else {
+            // Composite PK - pk_value is stored as JSON
+            let pk_match = pk_columns
+                .iter()
+                .map(|pk| format!(r#""{pk}"::text = (d.pk_value::jsonb->>'{pk}')"#))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                r#"
+                DELETE FROM public."{table}" p
+                USING "{schema}"."{deleted_table}" d
+                WHERE {pk_match}
+                "#,
+                schema = schema,
+                table = table_name,
+                deleted_table = deleted_table,
+                pk_match = pk_match,
+            )
+        };
+
         // Ignore error if deleted table doesn't exist
         if let Ok(deleted) = client.execute(&delete_sql, &[]).await {
             total_applied += deleted as usize;
