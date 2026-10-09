@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum DiffError {
@@ -71,6 +72,11 @@ fn validate_identifier(ident: &str) -> Result<(), DiffError> {
 fn safe_quote_ident(ident: &str) -> Result<String, DiffError> {
     validate_identifier(ident)?;
     Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
+}
+
+/// Quote an identifier to prevent SQL injection
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 /// Generate a diff for all changes in a session
@@ -149,13 +155,13 @@ async fn generate_table_diff(
     let pk_column = get_primary_key_column(client, source_schema, table_name).await?;
     let shadow_table = format!(
         "{}.{}",
-        safe_quote_ident(schema_name)?,
-        safe_quote_ident(&format!("_shadow_{}", table_name))?
+        quote_ident(schema_name),
+        quote_ident(&format!("_shadow_{}", table_name))
     );
     let source_table = format!(
         "{}.{}",
-        safe_quote_ident(source_schema)?,
-        safe_quote_ident(table_name)?
+        quote_ident(source_schema),
+        quote_ident(table_name)
     );
 
     let columns = get_table_columns(client, source_schema, table_name).await?;
@@ -177,7 +183,7 @@ async fn generate_table_diff(
         columns = column_list,
         shadow = shadow_table,
         source = source_table,
-        pk = safe_quote_ident(&pk_column)?,
+        pk = quote_ident(&pk_column),
     );
 
     let insert_rows = client.query(&insert_query, &[]).await?;
@@ -199,7 +205,7 @@ async fn generate_table_diff(
         columns = column_list,
         shadow = shadow_table,
         source = source_table,
-        pk = safe_quote_ident(&pk_column)?,
+        pk = quote_ident(&pk_column),
     );
 
     let update_rows = client.query(&update_query, &[]).await?;
@@ -212,8 +218,20 @@ async fn generate_table_diff(
         })
         .collect();
 
+    debug!(
+        table = table_name,
+        update_count = updates.len(),
+        "Found updates"
+    );
+
     // Find DELETEs
     let deletes = get_deletes(client, schema_name, source_schema, table_name, &pk_column).await?;
+
+    debug!(
+        table = table_name,
+        delete_count = deletes.len(),
+        "Found deletes"
+    );
 
     Ok(TableDiff {
         name: table_name.to_string(),
@@ -223,6 +241,7 @@ async fn generate_table_diff(
     })
 }
 
+/// Get deleted rows for a table
 async fn get_deletes(
     client: &tokio_postgres::Client,
     schema_name: &str,
@@ -251,8 +270,8 @@ async fn get_deletes(
 
     let deleted_table = format!(
         "{}.{}",
-        safe_quote_ident(schema_name)?,
-        safe_quote_ident(&deleted_table_name)?
+        quote_ident(schema_name),
+        quote_ident(&deleted_table_name)
     );
     let source_table = format!(
         "{}.{}",
@@ -260,6 +279,7 @@ async fn get_deletes(
         safe_quote_ident(table_name)?
     );
 
+    // Get the full row data from source for deleted rows
     let delete_query = format!(
         r#"
         SELECT row_to_json(p.*) as data
@@ -275,6 +295,7 @@ async fn get_deletes(
     Ok(delete_rows.iter().map(|r| r.get("data")).collect())
 }
 
+/// Get all non-system columns for a table
 async fn get_table_columns(
     client: &tokio_postgres::Client,
     schema_name: &str,
@@ -286,7 +307,6 @@ async fn get_table_columns(
             SELECT column_name
             FROM information_schema.columns
             WHERE table_schema = $1 AND table_name = $2
-              AND column_name NOT LIKE '_mlb_%'
             ORDER BY ordinal_position
             "#,
             &[&schema_name, &table_name],
@@ -324,5 +344,80 @@ async fn get_primary_key_column(
             "{}.{}",
             schema_name, table_name
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_table_diff_serialization() {
+        let diff = TableDiff {
+            name: "users".to_string(),
+            inserts: vec![serde_json::json!({"id": 99, "name": "new user"})],
+            updates: vec![RowChange {
+                row_id: "5".to_string(),
+                before: Some(serde_json::json!({"id": 5, "name": "old"})),
+                after: Some(serde_json::json!({"id": 5, "name": "new"})),
+            }],
+            deletes: vec![serde_json::json!({"id": 10, "name": "deleted user"})],
+        };
+
+        let json = serde_json::to_string(&diff).unwrap();
+        assert!(json.contains("users"));
+        assert!(json.contains("new user"));
+        assert!(json.contains("row_id"));
+    }
+
+    #[test]
+    fn test_session_diff_serialization() {
+        let diff = SessionDiff {
+            session_id: "abc-123".to_string(),
+            tables: vec![TableDiff {
+                name: "users".to_string(),
+                inserts: vec![],
+                updates: vec![],
+                deletes: vec![],
+            }],
+        };
+
+        let json = serde_json::to_string(&diff).unwrap();
+        assert!(json.contains("abc-123"));
+        assert!(json.contains("users"));
+    }
+
+    #[test]
+    fn test_row_change_serialization_omits_none() {
+        let change = RowChange {
+            row_id: "1".to_string(),
+            before: None,
+            after: Some(serde_json::json!({"id": 1})),
+        };
+
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(!json.contains("before"));
+        assert!(json.contains("after"));
+    }
+
+    #[test]
+    fn test_quote_ident() {
+        assert_eq!(quote_ident("users"), "\"users\"");
+        assert_eq!(quote_ident("my_table"), "\"my_table\"");
+        assert_eq!(quote_ident("with\"quote"), "\"with\"\"quote\"");
+    }
+
+    #[test]
+    fn test_validate_identifier_valid() {
+        assert!(validate_identifier("users").is_ok());
+        assert!(validate_identifier("my_table").is_ok());
+        assert!(validate_identifier("table-name").is_ok());
+    }
+
+    #[test]
+    fn test_validate_identifier_invalid() {
+        assert!(validate_identifier("").is_err());
+        assert!(validate_identifier("table;drop").is_err());
+        assert!(validate_identifier(&"a".repeat(100)).is_err());
     }
 }
