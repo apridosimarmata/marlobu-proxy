@@ -2,6 +2,13 @@
 //!
 //! Generates CREATE VIEW statements that union base table data with shadow table
 //! modifications, implementing copy-on-write semantics.
+//!
+//! # Security
+//!
+//! All identifiers (schema names, table names, column names) are quoted using
+//! `quote_ident()` which escapes embedded double-quotes per PostgreSQL standard.
+//! Identifier values in this module originate from database catalog queries
+//! (pg_catalog, information_schema), which are trusted sources.
 
 use crate::rewriter::tables::view_name_for_table;
 use deadpool_postgres::Pool;
@@ -19,11 +26,25 @@ pub enum ViewError {
 
     #[error("No columns found for table: {0}.{1}")]
     NoColumnsFound(String, String),
+
+    #[error("No primary key found for table: {0}.{1}")]
+    NoPrimaryKey(String, String),
 }
 
 pub type ViewResult<T> = Result<T, ViewError>;
 
-/// Quote an identifier to prevent SQL injection and handle special characters.
+/// Quote a SQL identifier to prevent injection.
+///
+/// Wraps the identifier in double quotes and escapes embedded quotes
+/// by doubling them (PostgreSQL standard).
+///
+/// # Security boundary
+///
+/// This function handles escaping but does NOT validate that the input
+/// is a legitimate identifier. Callers should ensure identifiers come
+/// from trusted sources (e.g., pg_catalog queries, information_schema).
+/// All identifier values in this module originate from database catalog
+/// queries, which are trusted sources.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
@@ -38,8 +59,13 @@ fn quote_ident(ident: &str) -> String {
 /// * `session_schema` - Schema containing the session's shadow/deleted tables
 /// * `source_schema` - Schema containing the production tables
 /// * `table_name` - Name of the table
-/// * `pk_columns` - Primary key column(s) for the table
+/// * `pk_columns` - Primary key column(s) for the table (must not be empty)
 /// * `columns` - Column names to include (excluding _mlb_* metadata columns)
+///
+/// # Errors
+///
+/// Returns `ViewError::NoPrimaryKey` if pk_columns is empty.
+/// Returns `ViewError::NoColumnsFound` if columns is empty.
 ///
 /// # Example output:
 /// ```sql
@@ -56,9 +82,19 @@ pub fn generate_union_view_sql(
     table_name: &str,
     pk_columns: &[String],
     columns: &[String],
-) -> String {
-    assert!(!pk_columns.is_empty(), "Primary key columns cannot be empty");
-    assert!(!columns.is_empty(), "Columns cannot be empty");
+) -> ViewResult<String> {
+    if pk_columns.is_empty() {
+        return Err(ViewError::NoPrimaryKey(
+            source_schema.to_string(),
+            table_name.to_string(),
+        ));
+    }
+    if columns.is_empty() {
+        return Err(ViewError::NoColumnsFound(
+            source_schema.to_string(),
+            table_name.to_string(),
+        ));
+    }
 
     let quoted_session_schema = quote_ident(session_schema);
     let quoted_source_schema = quote_ident(source_schema);
@@ -74,7 +110,7 @@ pub fn generate_union_view_sql(
     let pk_not_in_shadow = generate_pk_not_in_clause(pk_columns, &quoted_session_schema, &shadow_table);
     let pk_not_in_deleted = generate_pk_not_in_clause(pk_columns, &quoted_session_schema, &deleted_table);
 
-    format!(
+    Ok(format!(
         r#"CREATE OR REPLACE VIEW {session_schema}.{table_name} AS
 -- Shadow table rows (session's changes)
 SELECT {columns} FROM {session_schema}.{shadow_table}
@@ -90,14 +126,25 @@ WHERE {pk_not_in_shadow}
         columns = column_list,
         pk_not_in_shadow = pk_not_in_shadow,
         pk_not_in_deleted = pk_not_in_deleted,
-    )
+    ))
 }
 
 /// Generates the NOT IN clause for primary key filtering.
 /// Handles both single and composite primary keys.
 /// Adds IS NOT NULL filters to handle NULL values correctly in NOT IN subqueries.
+///
+/// # Panics
+///
+/// This is an internal helper that assumes pk_columns is non-empty.
+/// Public functions must validate pk_columns before calling this.
 fn generate_pk_not_in_clause(pk_columns: &[String], schema: &str, table: &str) -> String {
-    assert!(!pk_columns.is_empty(), "Primary key columns cannot be empty");
+    debug_assert!(!pk_columns.is_empty(), "pk_columns must be validated by caller");
+
+    if pk_columns.is_empty() {
+        // Defensive fallback - return a condition that's always true
+        // This should never happen if callers validate properly
+        return "TRUE".to_string();
+    }
 
     if pk_columns.len() == 1 {
         // Simple case: single column PK
@@ -160,6 +207,10 @@ pub async fn fetch_table_columns(
 }
 
 /// Fetches primary key columns for a table.
+///
+/// # Errors
+///
+/// Returns `ViewError::NoPrimaryKey` if the table has no primary key defined.
 pub async fn fetch_primary_key_columns(
     pool: &Pool,
     schema: &str,
@@ -184,7 +235,23 @@ pub async fn fetch_primary_key_columns(
         )
         .await?;
 
-    Ok(rows.iter().map(|r| r.get("column_name")).collect())
+    let pk_columns: Vec<String> = rows.iter().map(|r| r.get("column_name")).collect();
+
+    if pk_columns.is_empty() {
+        return Err(ViewError::NoPrimaryKey(
+            schema.to_string(),
+            table_name.to_string(),
+        ));
+    }
+
+    debug!(
+        schema = schema,
+        table = table_name,
+        pk_columns = ?pk_columns,
+        "Fetched primary key columns"
+    );
+
+    Ok(pk_columns)
 }
 
 /// Creates a union view that merges shadow table changes with production data.
@@ -200,6 +267,10 @@ pub async fn fetch_primary_key_columns(
 /// * `source_schema` - Schema containing the production tables (to get column info)
 /// * `table_name` - Name of the table
 /// * `pk_columns` - Primary key column(s)
+///
+/// # Errors
+///
+/// Returns `ViewError::NoPrimaryKey` if pk_columns is empty.
 pub async fn create_union_view(
     pool: &Pool,
     session_schema: &str,
@@ -208,8 +279,8 @@ pub async fn create_union_view(
     pk_columns: &[String],
 ) -> ViewResult<()> {
     if pk_columns.is_empty() {
-        return Err(ViewError::NoColumnsFound(
-            "primary key".to_string(),
+        return Err(ViewError::NoPrimaryKey(
+            source_schema.to_string(),
             table_name.to_string(),
         ));
     }
@@ -223,7 +294,7 @@ pub async fn create_union_view(
         table_name,
         pk_columns,
         &columns,
-    );
+    )?;
 
     debug!(
         session_schema = session_schema,
@@ -498,7 +569,7 @@ mod tests {
             "users",
             &pk_columns,
             &columns,
-        );
+        ).unwrap();
 
         // Check view creation
         assert!(sql.contains(r#"CREATE OR REPLACE VIEW "session_abc"."users""#));
@@ -533,7 +604,7 @@ mod tests {
             "order_items",
             &pk_columns,
             &columns,
-        );
+        ).unwrap();
 
         // Check composite PK handling with row comparison (with IS NOT NULL)
         assert!(sql.contains(
@@ -559,7 +630,7 @@ mod tests {
             "table\"name",
             &pk_columns,
             &columns,
-        );
+        ).unwrap();
 
         // Check proper quoting of special characters
         assert!(sql.contains(r#""session-with-dash""#));
@@ -597,5 +668,39 @@ mod tests {
             clause,
             r#"("a", "b", "c") NOT IN (SELECT "a", "b", "c" FROM "s"."t" WHERE "a" IS NOT NULL AND "b" IS NOT NULL AND "c" IS NOT NULL)"#
         );
+    }
+
+    #[test]
+    fn test_empty_pk_returns_error() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let pk_columns: Vec<String> = vec![];
+
+        let result = generate_union_view_sql(
+            "session",
+            "public",
+            "users",
+            &pk_columns,
+            &columns,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ViewError::NoPrimaryKey(_, _)));
+    }
+
+    #[test]
+    fn test_empty_columns_returns_error() {
+        let columns: Vec<String> = vec![];
+        let pk_columns = vec!["id".to_string()];
+
+        let result = generate_union_view_sql(
+            "session",
+            "public",
+            "users",
+            &pk_columns,
+            &columns,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ViewError::NoColumnsFound(_, _)));
     }
 }
