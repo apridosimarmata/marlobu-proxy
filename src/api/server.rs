@@ -1,5 +1,7 @@
 use anyhow::Result;
 use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -10,12 +12,23 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
 use crate::config::Config;
+use crate::metrics;
 use crate::session::SessionManager;
 
 use super::handlers::{
     approve_session, create_session, delete_session, get_mutations, get_session, get_session_diff,
     health_check, propose_session, reject_session, AppState,
 };
+
+/// Prometheus metrics endpoint - returns 500 if encoding fails
+async fn metrics_handler() -> Response {
+    let output = metrics::export_metrics();
+    if output.starts_with("# ERROR:") {
+        (StatusCode::INTERNAL_SERVER_ERROR, output).into_response()
+    } else {
+        output.into_response()
+    }
+}
 
 /// Build the API router with all routes
 pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
@@ -35,8 +48,9 @@ pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
         // Session data
         .route("/sessions/:id/mutations", get(get_mutations))
         .route("/sessions/:id/diff", get(get_session_diff))
-        // Health
+        // Observability
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
         // Middleware
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
