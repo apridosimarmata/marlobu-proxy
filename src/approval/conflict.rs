@@ -55,9 +55,9 @@ pub async fn check_conflicts(
             LEFT JOIN public.{table} p ON p.{pk}::text = es.row_id
             WHERE es.table_name = $1
         "#,
-            schema = schema_name,
-            table = table.table_name,
-            pk = table.primary_key,
+            schema = quote_ident(schema_name),
+            table = quote_ident(&table.table_name),
+            pk = quote_ident(&table.primary_key),
             columns = table.hash_columns.join(", "),
         ), &[&table.table_name]).await?;
 
@@ -107,7 +107,7 @@ pub async fn check_conflicts(
                 schema = schema_name,
                 table = table.table_name,
                 pk = table.primary_key,
-                pk_type = table.primary_key_type,
+                pk_type = quote_ident(&table.primary_key_type),
             ), &[&table.table_name]).await?;
 
             for row in collision_rows {
@@ -151,17 +151,18 @@ pub async fn get_hash_columns(
     let columns: Vec<String> = rows.iter().map(|row| {
         let col: String = row.get("column_name");
         let dtype: String = row.get("data_type");
+        let quoted_col = quote_ident(&col);
 
         // Handle NULL values and type coercion for stable hashing
         match dtype.as_str() {
-            "jsonb" | "json" => format!("COALESCE({}::text, '\\x00')", col),
+            "jsonb" | "json" => format!("COALESCE({}::text, '\\x00')", quoted_col),
             "timestamp with time zone" | "timestamp without time zone" => {
-                format!("COALESCE(to_char({}, 'YYYY-MM-DD HH24:MI:SS.US'), '\\x00')", col)
+                format!("COALESCE(to_char({}, 'YYYY-MM-DD HH24:MI:SS.US'), '\\x00')", quoted_col)
             }
             "numeric" | "decimal" | "real" | "double precision" => {
-                format!("COALESCE({}::numeric::text, '\\x00')", col)
+                format!("COALESCE({}::numeric::text, '\\x00')", quoted_col)
             }
-            _ => format!("COALESCE({}::text, '\\x00')", col),
+            _ => format!("COALESCE({}::text, '\\x00')", quoted_col),
         }
     }).collect();
 
