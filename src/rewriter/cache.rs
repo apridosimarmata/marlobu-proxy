@@ -36,7 +36,8 @@ pub struct CachedAnalysis {
 impl QueryCache {
     /// Create a new query cache with the given capacity.
     pub fn new(capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).expect("1000 is non-zero"));
+        let cap = NonZeroUsize::new(capacity)
+            .unwrap_or(NonZeroUsize::new(1000).expect("1000 is non-zero"));
         Self {
             cache: Mutex::new(LruCache::new(cap)),
         }
@@ -50,7 +51,10 @@ impl QueryCache {
             sql: sql.to_string(),
         };
         // Recover from poisoned mutex - cache data is still usable
-        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.get(&key).map(|c| c.analysis.clone())
     }
 
@@ -75,14 +79,20 @@ impl QueryCache {
             },
         };
         // Recover from poisoned mutex - cache data is still usable
-        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.put(key, cached);
     }
 
     /// Get cache statistics.
     pub fn stats(&self) -> CacheStats {
         // Recover from poisoned mutex - cache data is still usable
-        let cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         CacheStats {
             len: cache.len(),
             cap: cache.cap().get(),
