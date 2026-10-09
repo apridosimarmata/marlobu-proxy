@@ -85,8 +85,9 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                _ = cleanup_shutdown_rx.changed() => {
-                    if *cleanup_shutdown_rx.borrow() {
+                result = cleanup_shutdown_rx.changed() => {
+                    // Exit on error (sender dropped) or when shutdown signaled
+                    if result.is_err() || *cleanup_shutdown_rx.borrow_and_update() {
                         tracing::info!("Cleanup task shutting down");
                         break;
                     }
@@ -95,15 +96,18 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal
+    // Wait for shutdown signal (or unexpected server stop)
+    let mut api_handle = api_handle;
+    let mut proxy_handle = proxy_handle;
+
     tokio::select! {
         _ = signal_shutdown() => {
             tracing::info!("Shutdown signal received");
         }
-        _ = api_handle => {
+        _ = &mut api_handle => {
             tracing::warn!("API server stopped unexpectedly");
         }
-        _ = proxy_handle => {
+        _ = &mut proxy_handle => {
             tracing::warn!("Proxy server stopped unexpectedly");
         }
     }
@@ -112,8 +116,29 @@ async fn main() -> Result<()> {
     tracing::info!("Initiating graceful shutdown...");
     let _ = shutdown_tx.send(true);
 
+    // Wait for servers to drain connections (proxy has 30s timeout, give 35s total)
+    let drain_timeout = Duration::from_secs(35);
+
+    tracing::info!("Waiting for proxy to drain connections...");
+    match tokio::time::timeout(drain_timeout, proxy_handle).await {
+        Ok(Ok(())) => tracing::info!("Proxy server shutdown complete"),
+        Ok(Err(e)) => tracing::error!(error = %e, "Proxy server task failed"),
+        Err(_) => tracing::warn!("Proxy drain timeout reached"),
+    }
+
+    tracing::info!("Waiting for API server to stop...");
+    match tokio::time::timeout(Duration::from_secs(5), api_handle).await {
+        Ok(Ok(())) => tracing::info!("API server shutdown complete"),
+        Ok(Err(e)) => tracing::error!(error = %e, "API server task failed"),
+        Err(_) => tracing::warn!("API server shutdown timeout reached"),
+    }
+
     // Wait for cleanup task to finish
-    let _ = tokio::time::timeout(Duration::from_secs(5), cleanup_handle).await;
+    match tokio::time::timeout(Duration::from_secs(5), cleanup_handle).await {
+        Ok(Ok(())) => tracing::info!("Cleanup task shutdown complete"),
+        Ok(Err(e)) => tracing::error!(error = %e, "Cleanup task failed"),
+        Err(_) => tracing::warn!("Cleanup task shutdown timeout reached"),
+    }
 
     tracing::info!("Shutdown complete");
     Ok(())

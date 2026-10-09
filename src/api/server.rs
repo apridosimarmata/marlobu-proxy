@@ -62,11 +62,13 @@ pub async fn start_server(
 
 /// Wait for shutdown signal
 async fn shutdown_signal(mut rx: watch::Receiver<bool>) {
+    // Use borrow_and_update to avoid race conditions
+    // Exit on error (sender dropped) or when shutdown signaled
     loop {
         if rx.changed().await.is_err() {
             break;
         }
-        if *rx.borrow() {
+        if *rx.borrow_and_update() {
             break;
         }
     }
