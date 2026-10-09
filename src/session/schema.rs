@@ -1,6 +1,22 @@
 use deadpool_postgres::Pool;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
+
+/// Represents a primary key column with its name and PostgreSQL data type
+#[derive(Debug, Clone)]
+pub struct PrimaryKeyColumn {
+    pub name: String,
+    pub data_type: String,
+}
+
+/// Represents a primary key value for recording deletions
+#[derive(Debug, Clone)]
+pub enum PkValue {
+    /// Single column primary key
+    Single(String),
+    /// Composite primary key - values in same order as columns
+    Composite(Vec<String>),
+}
 
 #[derive(Error, Debug)]
 pub enum SchemaError {
@@ -72,6 +88,30 @@ impl SchemaManager {
         client.execute(&create_expected, &[]).await?;
 
         debug!(schema = schema_name, "Created tracking tables");
+
+        Ok(())
+    }
+
+    /// Create the _mlb_row_hashes table for conflict detection
+    /// This table stores MD5 hashes of rows at the time they were first accessed
+    pub async fn create_hash_table(&self, schema_name: &str) -> SchemaResult<()> {
+        let client = self.pool.get().await?;
+
+        let create_hash_table = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}._mlb_row_hashes (
+                table_name VARCHAR(255) NOT NULL,
+                pk_value VARCHAR(255) NOT NULL,
+                hash VARCHAR(32) NOT NULL,
+                captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (table_name, pk_value)
+            )
+            "#,
+            quote_ident(schema_name)
+        );
+        client.execute(&create_hash_table, &[]).await?;
+
+        info!(schema = schema_name, "Created _mlb_row_hashes table");
 
         Ok(())
     }
@@ -303,6 +343,224 @@ impl SchemaManager {
 
         Ok(rows.iter().map(|r| r.get("table_name")).collect())
     }
+
+    /// Get all primary key columns for a table (supports composite keys)
+    #[instrument(skip(self), fields(schema = %source_schema, table = %table_name))]
+    pub async fn get_primary_key_columns(
+        &self,
+        source_schema: &str,
+        table_name: &str,
+    ) -> SchemaResult<Vec<PrimaryKeyColumn>> {
+        let client = self.pool.get().await?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT a.attname as column_name,
+                       pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type
+                FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                JOIN pg_class c ON c.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE i.indisprimary
+                  AND n.nspname = $1
+                  AND c.relname = $2
+                ORDER BY array_position(i.indkey, a.attnum)
+                "#,
+                &[&source_schema, &table_name],
+            )
+            .await?;
+
+        if rows.is_empty() {
+            return Err(SchemaError::PrimaryKeyNotFound(format!(
+                "{}.{}",
+                source_schema, table_name
+            )));
+        }
+
+        let columns = rows
+            .iter()
+            .map(|r| PrimaryKeyColumn {
+                name: r.get("column_name"),
+                data_type: r.get("data_type"),
+            })
+            .collect();
+
+        debug!(
+            schema = source_schema,
+            table = table_name,
+            column_count = rows.len(),
+            "Retrieved primary key columns"
+        );
+
+        Ok(columns)
+    }
+
+    /// Create a deleted tracking table for a specific source table.
+    /// The deleted table stores just the primary key column(s) to track which rows were deleted.
+    #[instrument(skip(self), fields(session = %session_schema, source = %source_schema, table = %table_name))]
+    pub async fn create_deleted_table(
+        &self,
+        session_schema: &str,
+        source_schema: &str,
+        table_name: &str,
+    ) -> SchemaResult<String> {
+        let client = self.pool.get().await?;
+
+        // Get primary key columns from source table
+        let pk_columns = self.get_primary_key_columns(source_schema, table_name).await?;
+
+        let deleted_table_name = format!("_deleted_{}", table_name);
+        let full_table_name = format!(
+            "{}.{}",
+            quote_ident(session_schema),
+            quote_ident(&deleted_table_name)
+        );
+
+        // Build column definitions for PK columns
+        let pk_column_defs: Vec<String> = pk_columns
+            .iter()
+            .map(|col| format!("{} {}", quote_ident(&col.name), col.data_type))
+            .collect();
+
+        // Build PRIMARY KEY constraint
+        let pk_column_names: Vec<String> = pk_columns
+            .iter()
+            .map(|col| quote_ident(&col.name))
+            .collect();
+
+        let create_sql = format!(
+            r#"
+            CREATE TABLE {} (
+                {},
+                _mlb_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY ({})
+            )
+            "#,
+            full_table_name,
+            pk_column_defs.join(", "),
+            pk_column_names.join(", ")
+        );
+
+        client.execute(&create_sql, &[]).await?;
+
+        info!(
+            session_schema = session_schema,
+            table = table_name,
+            deleted_table = deleted_table_name,
+            pk_columns = ?pk_column_names,
+            "Created deleted tracking table"
+        );
+
+        Ok(full_table_name)
+    }
+
+    /// Check if a deleted tracking table exists for a given source table
+    #[instrument(skip(self), fields(session = %session_schema, table = %table_name))]
+    pub async fn deleted_table_exists(
+        &self,
+        session_schema: &str,
+        table_name: &str,
+    ) -> SchemaResult<bool> {
+        let client = self.pool.get().await?;
+
+        let deleted_table_name = format!("_deleted_{}", table_name);
+
+        let exists = self
+            .table_exists(&client, session_schema, &deleted_table_name)
+            .await?;
+
+        debug!(
+            session_schema = session_schema,
+            table = table_name,
+            deleted_table = deleted_table_name,
+            exists = exists,
+            "Checked deleted table existence"
+        );
+
+        Ok(exists)
+    }
+
+    /// Record a deletion in the deleted tracking table.
+    /// Creates the deleted table if it doesn't exist.
+    #[instrument(skip(self, pk_value), fields(session = %session_schema, source = %source_schema, table = %table_name))]
+    pub async fn record_deletion(
+        &self,
+        session_schema: &str,
+        source_schema: &str,
+        table_name: &str,
+        pk_value: &PkValue,
+    ) -> SchemaResult<()> {
+        let client = self.pool.get().await?;
+
+        // Ensure deleted table exists
+        let deleted_table_name = format!("_deleted_{}", table_name);
+        let table_exists = self
+            .table_exists(&client, session_schema, &deleted_table_name)
+            .await?;
+
+        if !table_exists {
+            self.create_deleted_table(session_schema, source_schema, table_name)
+                .await?;
+        }
+
+        // Get PK columns to know column names for insert
+        let pk_columns = self
+            .get_primary_key_columns(source_schema, table_name)
+            .await?;
+
+        let full_table_name = format!(
+            "{}.{}",
+            quote_ident(session_schema),
+            quote_ident(&deleted_table_name)
+        );
+
+        // Build column names list
+        let column_names: Vec<String> = pk_columns
+            .iter()
+            .map(|col| quote_ident(&col.name))
+            .collect();
+
+        // Get values based on PkValue type
+        let values: Vec<&str> = match pk_value {
+            PkValue::Single(v) => vec![v.as_str()],
+            PkValue::Composite(vs) => vs.iter().map(|s| s.as_str()).collect(),
+        };
+
+        if values.len() != pk_columns.len() {
+            return Err(SchemaError::PrimaryKeyNotFound(format!(
+                "Expected {} PK values for {}.{}, got {}",
+                pk_columns.len(),
+                source_schema,
+                table_name,
+                values.len()
+            )));
+        }
+
+        // Build parameterized INSERT with ON CONFLICT DO NOTHING (idempotent)
+        let placeholders: Vec<String> = (1..=values.len()).map(|i| format!("${}", i)).collect();
+
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+            full_table_name,
+            column_names.join(", "),
+            placeholders.join(", ")
+        );
+
+        // Convert values to params - all as TEXT since Postgres will cast
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            values.iter().map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        client.execute(&insert_sql, &params).await?;
+
+        info!(
+            session_schema = session_schema,
+            table = table_name,
+            "Recorded deletion"
+        );
+
+        Ok(())
+    }
 }
 
 /// Quote an identifier to prevent SQL injection
@@ -329,5 +587,101 @@ mod tests {
 
         let key3 = SchemaManager::advisory_lock_key("session_123", "orders");
         assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn test_pk_value_single() {
+        let pk = PkValue::Single("123".to_string());
+        match pk {
+            PkValue::Single(v) => assert_eq!(v, "123"),
+            PkValue::Composite(_) => panic!("Expected Single variant"),
+        }
+    }
+
+    #[test]
+    fn test_pk_value_composite() {
+        let pk = PkValue::Composite(vec!["abc".to_string(), "456".to_string()]);
+        match pk {
+            PkValue::Single(_) => panic!("Expected Composite variant"),
+            PkValue::Composite(v) => {
+                assert_eq!(v.len(), 2);
+                assert_eq!(v[0], "abc");
+                assert_eq!(v[1], "456");
+            }
+        }
+    }
+
+    #[test]
+    fn test_primary_key_column() {
+        let col = PrimaryKeyColumn {
+            name: "user_id".to_string(),
+            data_type: "integer".to_string(),
+        };
+        assert_eq!(col.name, "user_id");
+        assert_eq!(col.data_type, "integer");
+    }
+
+    #[test]
+    fn test_deleted_table_name_format() {
+        // Verify the naming convention for deleted tables
+        let table_name = "users";
+        let deleted_table_name = format!("_deleted_{}", table_name);
+        assert_eq!(deleted_table_name, "_deleted_users");
+
+        let table_name = "order_items";
+        let deleted_table_name = format!("_deleted_{}", table_name);
+        assert_eq!(deleted_table_name, "_deleted_order_items");
+    }
+
+    #[test]
+    fn test_quote_ident_with_special_chars() {
+        // Table names with special characters should be properly escaped
+        assert_eq!(quote_ident("table-name"), "\"table-name\"");
+        assert_eq!(quote_ident("123numeric"), "\"123numeric\"");
+        assert_eq!(quote_ident("UPPERCASE"), "\"UPPERCASE\"");
+        assert_eq!(quote_ident("mixed_Case-Name"), "\"mixed_Case-Name\"");
+    }
+
+    #[test]
+    fn test_pk_column_sql_generation() {
+        // Test that we can build proper SQL column definitions
+        let columns = vec![
+            PrimaryKeyColumn {
+                name: "tenant_id".to_string(),
+                data_type: "uuid".to_string(),
+            },
+            PrimaryKeyColumn {
+                name: "user_id".to_string(),
+                data_type: "bigint".to_string(),
+            },
+        ];
+
+        let pk_column_defs: Vec<String> = columns
+            .iter()
+            .map(|col| format!("{} {}", quote_ident(&col.name), col.data_type))
+            .collect();
+
+        assert_eq!(pk_column_defs.len(), 2);
+        assert_eq!(pk_column_defs[0], "\"tenant_id\" uuid");
+        assert_eq!(pk_column_defs[1], "\"user_id\" bigint");
+
+        let pk_column_names: Vec<String> = columns
+            .iter()
+            .map(|col| quote_ident(&col.name))
+            .collect();
+
+        assert_eq!(pk_column_names.join(", "), "\"tenant_id\", \"user_id\"");
+    }
+
+    #[test]
+    fn test_insert_placeholders_generation() {
+        // Test placeholder generation for parameterized queries
+        let num_columns = 3;
+        let placeholders: Vec<String> = (1..=num_columns).map(|i| format!("${}", i)).collect();
+        assert_eq!(placeholders.join(", "), "$1, $2, $3");
+
+        let num_columns = 1;
+        let placeholders: Vec<String> = (1..=num_columns).map(|i| format!("${}", i)).collect();
+        assert_eq!(placeholders.join(", "), "$1");
     }
 }
