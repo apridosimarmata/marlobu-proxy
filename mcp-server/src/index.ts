@@ -156,6 +156,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "marlobu_diff": {
+        if (!session) {
+          return { content: [{ type: "text", text: "No active session. Run a query or mutation first." }] };
+        }
         const diff = await session.diff();
         if (!diff || Object.keys(diff).length === 0) {
           return { content: [{ type: "text", text: "No pending changes" }] };
@@ -164,6 +167,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "marlobu_propose": {
+        if (!session) {
+          return { content: [{ type: "text", text: "No active session. Run a mutation first." }] };
+        }
         const sessionId = session.id;
         await session.propose();
         session = null;
