@@ -55,4 +55,9 @@ Same pattern using LangChain's tool abstraction.
 
 ## Security Note
 
-These examples pass SQL directly to the database for simplicity. In production, add input validation and use parameterized queries.
+These examples include basic protections:
+- SQL statement type validation (SELECT only for queries, INSERT/UPDATE/DELETE only for mutations)
+- Dangerous keyword blocking (DROP, TRUNCATE, ALTER, CREATE, GRANT, REVOKE)
+- Error handling for database and API operations
+
+For production use, also consider parameterized queries and rate limiting.

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from openai import OpenAI
 from marlobu import Marlobu
 
@@ -44,6 +45,28 @@ tools = [
     }
 ]
 
+# SQL validation patterns
+SELECT_PATTERN = re.compile(r"^\s*SELECT\s", re.IGNORECASE)
+MUTATE_PATTERN = re.compile(r"^\s*(INSERT|UPDATE|DELETE)\s", re.IGNORECASE)
+DANGEROUS_PATTERN = re.compile(r"(DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE)", re.IGNORECASE)
+
+
+def validate_sql(sql: str, expected_type: str) -> tuple[bool, str]:
+    """Validate SQL query type and check for dangerous patterns."""
+    if not sql or not sql.strip():
+        return False, "Empty SQL query"
+
+    if DANGEROUS_PATTERN.search(sql):
+        return False, "Query contains blocked keywords (DROP, TRUNCATE, ALTER, etc.)"
+
+    if expected_type == "select" and not SELECT_PATTERN.match(sql):
+        return False, "Query tool only accepts SELECT statements"
+
+    if expected_type == "mutate" and not MUTATE_PATTERN.match(sql):
+        return False, "Mutate tool only accepts INSERT, UPDATE, or DELETE statements"
+
+    return True, ""
+
 
 def run_agent(user_input: str):
     """Run the agent with a Marlobu session."""
@@ -56,23 +79,40 @@ def run_agent(user_input: str):
     ) as session:
 
         def handle_tool(name: str, args: dict) -> str:
-            if name == "query":
-                result = session.execute(args["sql"])
-                return json.dumps(result) if result else "No results"
-            elif name == "mutate":
-                session.execute(args["sql"])
-                return "Mutation staged for review"
-            return "Unknown tool"
+            try:
+                sql = args.get("sql", "")
+
+                if name == "query":
+                    valid, error = validate_sql(sql, "select")
+                    if not valid:
+                        return f"Error: {error}"
+                    result = session.execute(sql)
+                    return json.dumps(result) if result else "No results"
+
+                elif name == "mutate":
+                    valid, error = validate_sql(sql, "mutate")
+                    if not valid:
+                        return f"Error: {error}"
+                    session.execute(sql)
+                    return "Mutation staged for review"
+
+                return "Unknown tool"
+            except Exception as e:
+                return f"Error: {str(e)}"
 
         messages = [{"role": "user", "content": user_input}]
 
         # Agent loop
         while True:
-            response = openai.chat.completions.create(
-                model="gpt-4",
-                messages=messages,
-                tools=tools,
-            )
+            try:
+                response = openai.chat.completions.create(
+                    model="gpt-4",
+                    messages=messages,
+                    tools=tools,
+                )
+            except Exception as e:
+                print(f"OpenAI API error: {e}")
+                return None
 
             msg = response.choices[0].message
             messages.append(msg)
@@ -83,7 +123,12 @@ def run_agent(user_input: str):
 
             # Handle tool calls
             for tc in msg.tool_calls:
-                result = handle_tool(tc.function.name, json.loads(tc.function.arguments))
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+
+                result = handle_tool(tc.function.name, args)
                 print(f"  [{tc.function.name}] {result[:100]}...")
                 messages.append({
                     "role": "tool",

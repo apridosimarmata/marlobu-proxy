@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_openai_tools_agent, AgentExecutor
@@ -15,19 +16,53 @@ marlobu = Marlobu(
 )
 session = None  # Set when running
 
+# SQL validation patterns
+SELECT_PATTERN = re.compile(r"^\s*SELECT\s", re.IGNORECASE)
+MUTATE_PATTERN = re.compile(r"^\s*(INSERT|UPDATE|DELETE)\s", re.IGNORECASE)
+DANGEROUS_PATTERN = re.compile(r"(DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE)", re.IGNORECASE)
+
+
+def validate_sql(sql: str, expected_type: str) -> tuple[bool, str]:
+    """Validate SQL query type and check for dangerous patterns."""
+    if not sql or not sql.strip():
+        return False, "Empty SQL query"
+
+    if DANGEROUS_PATTERN.search(sql):
+        return False, "Query contains blocked keywords (DROP, TRUNCATE, ALTER, etc.)"
+
+    if expected_type == "select" and not SELECT_PATTERN.match(sql):
+        return False, "Query tool only accepts SELECT statements"
+
+    if expected_type == "mutate" and not MUTATE_PATTERN.match(sql):
+        return False, "Mutate tool only accepts INSERT, UPDATE, or DELETE statements"
+
+    return True, ""
+
 
 @tool
 def query(sql: str) -> str:
     """Execute a SELECT query on the database."""
-    result = session.execute(sql)
-    return json.dumps(result) if result else "No results"
+    try:
+        valid, error = validate_sql(sql, "select")
+        if not valid:
+            return f"Error: {error}"
+        result = session.execute(sql)
+        return json.dumps(result) if result else "No results"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 @tool
 def mutate(sql: str) -> str:
     """Execute UPDATE, INSERT, or DELETE. Changes are staged for review."""
-    session.execute(sql)
-    return "Mutation staged for review"
+    try:
+        valid, error = validate_sql(sql, "mutate")
+        if not valid:
+            return f"Error: {error}"
+        session.execute(sql)
+        return "Mutation staged for review"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 def run_agent(user_input: str):
@@ -54,8 +89,12 @@ def run_agent(user_input: str):
     ) as sess:
         session = sess
 
-        result = executor.invoke({"input": user_input})
-        print(f"\nAgent: {result['output']}")
+        try:
+            result = executor.invoke({"input": user_input})
+            print(f"\nAgent: {result['output']}")
+        except Exception as e:
+            print(f"Agent error: {e}")
+            return None
 
         # Show staged changes
         diff = sess.diff()
