@@ -1,4 +1,4 @@
-module github.com/apridosimarmata/marlobu-proxy/sdks/go
+module github.com/aprdos/marlobu-proxy/sdks/go
 
 go 1.21
 

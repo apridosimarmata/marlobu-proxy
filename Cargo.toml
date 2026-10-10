@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Postgres wire protocol proxy for session-based database isolation"
 license = "MIT"
+repository = "https://github.com/apridosimarmata/marlobu-proxy"
+readme = "README.md"
+keywords = ["postgres", "proxy", "database", "sandbox", "testing"]
+categories = ["database", "development-tools"]
 
 [dependencies]
 # Async runtime

@@ -43,10 +43,38 @@ This enables workflows like data review, staging environments, and safe bulk ope
 
 ### Installation
 
+**Proxy**
+
 ```bash
-git clone https://github.com/apridosimarmata/marlobu-proxy.git
+# Via crates.io
+cargo install marlobu-proxy
+
+# Via Docker
+docker pull ghcr.io/aprdos/marlobu-proxy
+
+# From source
+git clone https://github.com/aprdos/marlobu-proxy.git
 cd marlobu-proxy
 cargo build --release
+```
+
+**SDKs**
+
+```bash
+# Node.js
+npm install marlobu
+
+# Python
+pip install marlobu
+
+# Go
+go get github.com/aprdos/marlobu-proxy/sdks/go/marlobu
+```
+
+**MCP Server** (for Claude Code integration)
+
+```bash
+npm install -g @marlobu/mcp-server
 ```
 
 ### Configuration
