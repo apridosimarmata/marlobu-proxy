@@ -16,6 +16,8 @@ export interface MarlobuConfig {
 export interface CreateSessionOptions {
   /** Project identifier for the session */
   projectId: string;
+  /** Proxy mode: 'wiper' (discard on end) or 'agentic' (review required) */
+  mode?: 'wiper' | 'agentic';
 }
 
 /** Session status */

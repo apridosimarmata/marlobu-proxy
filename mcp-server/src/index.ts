@@ -12,21 +12,28 @@ import { Pool } from "pg";
 // Proxy modes
 type Mode = "wiper" | "agentic";
 
+function parseMode(value: string | undefined): Mode {
+  const normalized = value?.toLowerCase();
+  if (normalized === "wiper" || normalized === "agentic") {
+    return normalized;
+  }
+  if (normalized !== undefined) {
+    console.error("Error: MARLOBU_MODE must be 'wiper' or 'agentic'");
+    process.exit(1);
+  }
+  return "agentic"; // default
+}
+
 const API_URL = process.env.MARLOBU_API_URL || "http://localhost:8080";
 const PROXY_HOST = process.env.MARLOBU_PROXY_HOST || "localhost";
 const PROXY_PORT = parseInt(process.env.MARLOBU_PROXY_PORT || "5433");
 const DATABASE = process.env.DATABASE_NAME;
 const USER = process.env.DATABASE_USER;
 const PASSWORD = process.env.DATABASE_PASSWORD;
-const MODE: Mode = (process.env.MARLOBU_MODE?.toLowerCase() as Mode) || "agentic";
+const MODE: Mode = parseMode(process.env.MARLOBU_MODE);
 
 if (!DATABASE || !USER || !PASSWORD) {
   console.error("Error: DATABASE_NAME, DATABASE_USER, and DATABASE_PASSWORD environment variables are required");
-  process.exit(1);
-}
-
-if (!["wiper", "agentic"].includes(MODE)) {
-  console.error("Error: MARLOBU_MODE must be 'wiper' or 'agentic'");
   process.exit(1);
 }
 
@@ -177,7 +184,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     // Ensure session and pool exist
     if (!session || !pool) {
-      session = await client.createSession({ projectId: "claude-code" });
+      session = await client.createSession({ projectId: "claude-code", mode: MODE });
       pool = session.createPool({
         database: DATABASE,
         user: USER,
