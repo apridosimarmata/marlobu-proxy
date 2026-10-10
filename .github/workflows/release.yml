@@ -98,7 +98,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  npm-publish:
+  npm-mcp-server:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -130,6 +130,40 @@ jobs:
 
       - name: Publish to npm
         working-directory: mcp-server
+        run: npm publish --access public --provenance
+
+  npm-sdk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Update package version
+        working-directory: sdks/node
+        run: npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version
+
+      - name: Install dependencies
+        working-directory: sdks/node
+        run: npm install
+
+      - name: Build
+        working-directory: sdks/node
+        run: npm run build
+
+      - name: Publish to npm
+        working-directory: sdks/node
         run: npm publish --access public --provenance
 
   crates-publish:
