@@ -1,0 +1,4 @@
+marlobu
+openai
+langchain
+langchain-openai
