@@ -12,10 +12,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "marlobu": "file:../sdks/nodejs"
+    "marlobu": "file:../sdks/node",
+    "pg": "^8.11.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/pg": "^8.10.0",
     "typescript": "^5.0.0",
     "ts-node": "^10.9.0"
   }

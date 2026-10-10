@@ -6,7 +6,8 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Marlobu } from "marlobu";
+import { Marlobu, Session } from "marlobu";
+import { Pool } from "pg";
 
 const API_URL = process.env.MARLOBU_API_URL || "http://localhost:8080";
 const PROXY_HOST = process.env.MARLOBU_PROXY_HOST || "localhost";
@@ -21,7 +22,46 @@ const client = new Marlobu({
   proxyPort: PROXY_PORT,
 });
 
-let session: any = null;
+let session: Session | null = null;
+let pool: Pool | null = null;
+
+function classifySQL(sql: string): "select" | "mutate" | "other" {
+  const normalized = sql
+    .replace(/\/\*[\s\S]*?\*\//g, "")  // remove block comments
+    .replace(/--.*$/gm, "")             // remove line comments
+    .trim()
+    .toUpperCase();
+
+  if (normalized.startsWith("SELECT") || normalized.startsWith("WITH")) {
+    return "select";
+  }
+  if (normalized.startsWith("INSERT") || normalized.startsWith("UPDATE") || normalized.startsWith("DELETE")) {
+    return "mutate";
+  }
+  return "other";
+}
+
+async function cleanup() {
+  if (session) {
+    try {
+      await session.destroy();
+    } catch (e) {
+      console.error("Failed to destroy session:", e);
+    }
+    session = null;
+    pool = null;
+  }
+}
+
+process.on("SIGINT", async () => {
+  await cleanup();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  await cleanup();
+  process.exit(0);
+});
 
 const server = new Server(
   { name: "marlobu", version: "0.1.0" },
@@ -75,10 +115,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    // Ensure session exists
-    if (!session) {
+    // Ensure session and pool exist
+    if (!session || !pool) {
       session = await client.createSession({ projectId: "claude-code" });
-      await session.connect({
+      pool = session.createPool({
         database: DATABASE,
         user: USER,
         password: PASSWORD,
@@ -88,21 +128,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "marlobu_query": {
         const sql = (args as { sql: string }).sql;
-        if (!sql.trim().toUpperCase().startsWith("SELECT")) {
-          return { content: [{ type: "text", text: "Error: Only SELECT queries allowed" }] };
+        if (classifySQL(sql) !== "select") {
+          return { content: [{ type: "text", text: "Error: Only SELECT queries allowed. Use marlobu_mutate for INSERT/UPDATE/DELETE." }] };
         }
-        const result = await session.execute(sql);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        const result = await pool.query(sql);
+        return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
       }
 
       case "marlobu_mutate": {
         const sql = (args as { sql: string }).sql;
-        const upper = sql.trim().toUpperCase();
-        if (!upper.startsWith("INSERT") && !upper.startsWith("UPDATE") && !upper.startsWith("DELETE")) {
-          return { content: [{ type: "text", text: "Error: Only INSERT/UPDATE/DELETE allowed" }] };
+        if (classifySQL(sql) !== "mutate") {
+          return { content: [{ type: "text", text: "Error: Only INSERT/UPDATE/DELETE allowed. Use marlobu_query for SELECT." }] };
         }
-        await session.execute(sql);
-        return { content: [{ type: "text", text: "Mutation staged for review" }] };
+        const result = await pool.query(sql);
+        return { content: [{ type: "text", text: `Mutation staged: ${result.rowCount} row(s) affected` }] };
       }
 
       case "marlobu_diff": {
