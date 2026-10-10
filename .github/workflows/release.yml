@@ -143,19 +143,36 @@ jobs:
       - name: Publish to crates.io
         run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  homebrew-tap:
-    needs: release
+  pypi-publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Extract version
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Update Homebrew formula
-        uses: mislav/bump-homebrew-formula-action@v3
+      - name: Update package version
+        working-directory: sdks/python
+        run: |
+          sed -i "s/version = \".*\"/version = \"${{ steps.version.outputs.VERSION }}\"/" pyproject.toml
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        working-directory: sdks/python
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          formula-name: marlobu-proxy
-          homebrew-tap: apridosimarmata/homebrew-tap
-          download-url: https://github.com/apridosimarmata/marlobu-proxy/releases/download/${{ github.ref_name }}/marlobu-proxy-darwin-arm64.tar.gz
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          packages-dir: sdks/python/dist/
