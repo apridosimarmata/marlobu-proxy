@@ -45,6 +45,14 @@ python langchain_agent.py "Find all admin users"
 
 Same pattern using LangChain's tool abstraction.
 
+### Multi-turn Chatbot
+
+```bash
+python chatbot.py
+```
+
+Interactive chatbot that maintains conversation history. Type `done` to propose changes or `quit` to discard.
+
 ## How it works
 
 1. Agent connects through Marlobu proxy
