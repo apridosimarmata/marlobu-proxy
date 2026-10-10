@@ -40,9 +40,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/marlobu/marlobu-proxy"
-Documentation = "https://github.com/marlobu/marlobu-proxy#readme"
-Repository = "https://github.com/marlobu/marlobu-proxy"
+Homepage = "https://github.com/aprdos/marlobu-proxy"
+Documentation = "https://github.com/aprdos/marlobu-proxy#readme"
+Repository = "https://github.com/aprdos/marlobu-proxy"
 
 [tool.setuptools.packages.find]
 where = ["."]
