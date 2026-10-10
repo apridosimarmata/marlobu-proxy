@@ -9,13 +9,13 @@ Minimal examples showing how to integrate AI agents with Marlobu.
 pip install marlobu openai langchain langchain-openai
 
 # Set environment variables
-export DATABASE_NAME=mydb
-export DATABASE_USER=postgres
-export DATABASE_PASSWORD=your_password
-export OPENAI_API_KEY=sk-...
+export DATABASE_NAME=<your_database>
+export DATABASE_USER=<your_user>
+export DATABASE_PASSWORD=<your_password>
+export OPENAI_API_KEY=<your_api_key>
 
 # Start the Marlobu proxy (from repo root)
-DATABASE_URL=postgres://user:pass@localhost/mydb \
+DATABASE_URL=postgres://<user>:<password>@localhost/<database> \
 ./target/release/marlobu-proxy
 ```
 
