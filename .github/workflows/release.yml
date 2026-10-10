@@ -132,8 +132,6 @@ jobs:
       - name: Publish to npm
         working-directory: mcp-server
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   npm-sdk:
     runs-on: ubuntu-latest
@@ -168,8 +166,6 @@ jobs:
       - name: Publish to npm
         working-directory: sdks/node
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   crates-publish:
     runs-on: ubuntu-latest
