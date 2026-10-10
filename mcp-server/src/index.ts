@@ -164,8 +164,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "marlobu_propose": {
-        await session.propose();
         const sessionId = session.id;
+        await session.propose();
         session = null;
         pool = null;
         return { content: [{ type: "text", text: `Session ${sessionId} proposed for review. Session closed.` }] };
