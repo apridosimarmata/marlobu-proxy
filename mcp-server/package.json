@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "marlobu": "file:../sdks/node",
+    "marlobu": "^0.1.0",
     "pg": "^8.11.0"
   },
   "devDependencies": {

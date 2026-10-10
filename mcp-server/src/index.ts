@@ -12,9 +12,14 @@ import { Pool } from "pg";
 const API_URL = process.env.MARLOBU_API_URL || "http://localhost:8080";
 const PROXY_HOST = process.env.MARLOBU_PROXY_HOST || "localhost";
 const PROXY_PORT = parseInt(process.env.MARLOBU_PROXY_PORT || "5433");
-const DATABASE = process.env.DATABASE_NAME || "";
-const USER = process.env.DATABASE_USER || "";
-const PASSWORD = process.env.DATABASE_PASSWORD || "";
+const DATABASE = process.env.DATABASE_NAME;
+const USER = process.env.DATABASE_USER;
+const PASSWORD = process.env.DATABASE_PASSWORD;
+
+if (!DATABASE || !USER || !PASSWORD) {
+  console.error("Error: DATABASE_NAME, DATABASE_USER, and DATABASE_PASSWORD environment variables are required");
+  process.exit(1);
+}
 
 const client = new Marlobu({
   apiUrl: API_URL,
@@ -31,6 +36,12 @@ function classifySQL(sql: string): "select" | "mutate" | "other" {
     .replace(/--.*$/gm, "")             // remove line comments
     .trim()
     .toUpperCase();
+
+  // Reject multi-statement queries to prevent bypass attacks
+  const semicolonIndex = normalized.indexOf(";");
+  if (semicolonIndex !== -1 && semicolonIndex < normalized.length - 1) {
+    return "other";
+  }
 
   if (normalized.startsWith("SELECT") || normalized.startsWith("WITH")) {
     return "select";
@@ -154,7 +165,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "marlobu_propose": {
         await session.propose();
-        return { content: [{ type: "text", text: `Session ${session.id} proposed for review` }] };
+        const sessionId = session.id;
+        session = null;
+        pool = null;
+        return { content: [{ type: "text", text: `Session ${sessionId} proposed for review. Session closed.` }] };
       }
 
       default:
