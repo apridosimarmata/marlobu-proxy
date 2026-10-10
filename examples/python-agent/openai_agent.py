@@ -71,6 +71,12 @@ def validate_sql(sql: str, expected_type: str) -> tuple[bool, str]:
 def run_agent(user_input: str):
     """Run the agent with a Marlobu session."""
 
+    required = ["DATABASE_NAME", "DATABASE_USER", "DATABASE_PASSWORD", "OPENAI_API_KEY"]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        print(f"Missing environment variables: {', '.join(missing)}")
+        return None
+
     with marlobu.session(
         project_id="openai-agent",
         database=os.environ["DATABASE_NAME"],

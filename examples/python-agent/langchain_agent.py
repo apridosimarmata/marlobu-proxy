@@ -42,6 +42,8 @@ def validate_sql(sql: str, expected_type: str) -> tuple[bool, str]:
 @tool
 def query(sql: str) -> str:
     """Execute a SELECT query on the database."""
+    if session is None:
+        return "Error: No active session"
     try:
         valid, error = validate_sql(sql, "select")
         if not valid:
@@ -55,6 +57,8 @@ def query(sql: str) -> str:
 @tool
 def mutate(sql: str) -> str:
     """Execute UPDATE, INSERT, or DELETE. Changes are staged for review."""
+    if session is None:
+        return "Error: No active session"
     try:
         valid, error = validate_sql(sql, "mutate")
         if not valid:
@@ -68,6 +72,12 @@ def mutate(sql: str) -> str:
 def run_agent(user_input: str):
     """Run the LangChain agent with a Marlobu session."""
     global session
+
+    required = ["DATABASE_NAME", "DATABASE_USER", "DATABASE_PASSWORD", "OPENAI_API_KEY"]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        print(f"Missing environment variables: {', '.join(missing)}")
+        return None
 
     llm = ChatOpenAI(model="gpt-4")
     tools = [query, mutate]

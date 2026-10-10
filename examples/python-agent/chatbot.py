@@ -64,6 +64,12 @@ def validate_sql(sql: str, expected_type: str) -> tuple[bool, str]:
 def run_chatbot():
     """Run a multi-turn chatbot with a persistent Marlobu session."""
 
+    required = ["DATABASE_NAME", "DATABASE_USER", "DATABASE_PASSWORD", "OPENAI_API_KEY"]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        print(f"Missing environment variables: {', '.join(missing)}")
+        return
+
     session = marlobu.create_session(project_id="chatbot")
     session.connect(
         database=os.environ["DATABASE_NAME"],
