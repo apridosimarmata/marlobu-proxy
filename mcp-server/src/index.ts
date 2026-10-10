@@ -37,9 +37,10 @@ function classifySQL(sql: string): "select" | "mutate" | "other" {
     .trim()
     .toUpperCase();
 
-  // Reject multi-statement queries to prevent bypass attacks
-  const semicolonIndex = normalized.indexOf(";");
-  if (semicolonIndex !== -1 && semicolonIndex < normalized.length - 1) {
+  // Remove string literals before checking for semicolons
+  const withoutStrings = normalized.replace(/'(?:[^']|'')*'/g, "");
+  const semicolonIndex = withoutStrings.indexOf(";");
+  if (semicolonIndex !== -1 && semicolonIndex < withoutStrings.length - 1) {
     return "other";
   }
 
@@ -53,14 +54,16 @@ function classifySQL(sql: string): "select" | "mutate" | "other" {
 }
 
 async function cleanup() {
-  if (session) {
+  const currentSession = session;
+  session = null;
+  pool = null;
+
+  if (currentSession) {
     try {
-      await session.destroy();
+      await currentSession.destroy();
     } catch (e) {
       console.error("Failed to destroy session:", e);
     }
-    session = null;
-    pool = null;
   }
 }
 
@@ -171,9 +174,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "No active session. Run a mutation first." }] };
         }
         const sessionId = session.id;
-        await session.propose();
-        session = null;
-        pool = null;
+        try {
+          await session.propose();
+        } finally {
+          session = null;
+          pool = null;
+        }
         return { content: [{ type: "text", text: `Session ${sessionId} proposed for review. Session closed.` }] };
       }
 
