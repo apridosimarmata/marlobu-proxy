@@ -98,6 +98,76 @@
 
 ---
 
+## Proxy Modes (v0.6)
+*Two modes for different use cases*
+
+### Overview
+
+Marlobu supports two operational modes to cover different use cases:
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| **WIPER** | Staged → discarded | Dev/testing, disposable sandbox |
+| **AGENTIC** | Staged → human approval → apply | Production agents, data ops |
+
+Both modes use shadow tables for complete isolation. Marlobu strictly owns safety and staging — there is no passthrough mode.
+
+### WIPER_MODE (Default for development)
+
+All mutations are staged in shadow tables but **never applied to production**. Session is ephemeral and discarded at end. Ideal for:
+- AI-assisted feature development
+- Integration tests against real data
+- CI/CD test runs
+- Experimentation without consequences
+
+```
+Agent writes code → Tests against real data → Session destroyed
+```
+
+### AGENTIC_MODE (Default for production)
+
+All mutations are staged and **require human approval** via `propose()` → `approve()` workflow. Current behavior. Ideal for:
+- AI agents handling customer data
+- Data operations (refunds, corrections)
+- Bulk updates requiring review
+
+```
+Agent proposes changes → Human reviews diff → Approve or reject
+```
+
+### Implementation Plan
+
+**1. Connection-level mode selection**
+```
+postgresql://user:pass@proxy:5433/db?mode=wiper
+postgresql://user:pass@proxy:5433/db?mode=agentic
+```
+
+**2. Environment variable defaults**
+- `MARLOBU_DEFAULT_MODE=wiper` for local/dev
+- `MARLOBU_DEFAULT_MODE=agentic` for production
+
+**3. MCP server mode awareness**
+- Mode passed in tool descriptions
+- Agent sees: "Current Mode: AGENTIC_MODE. Mutations require approval."
+- Prevents confusion about why writes aren't immediately visible
+
+**4. Visual distinction**
+- WIPER: Purple/gray (ephemeral, safe)
+- AGENTIC: Yellow/amber (pending review)
+
+### Tasks
+
+- [x] Add `mode` parameter to session creation API
+- [x] Add `SessionMode` enum to session manager
+- [x] Update database schema with mode column
+- [x] Add mode to MCP server config and tool responses
+- [ ] Parse mode from connection string options
+- [ ] Implement WIPER_MODE (auto-destroy on disconnect)
+- [ ] Update docs and site messaging
+
+---
+
 ## Phase 5: Enterprise Features (v0.6)
 *Sell to companies*
 

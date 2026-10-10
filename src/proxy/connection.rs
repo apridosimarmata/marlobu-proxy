@@ -20,6 +20,7 @@ use crate::proxy::protocol::{
 };
 use crate::rewriter::{QueryAnalysis, QueryCache, QueryType, Rewriter};
 use crate::session::schema::SchemaManager;
+use crate::session::{SessionManager, SessionMode};
 
 /// Default buffer size for connection I/O (16KB for better throughput).
 const DEFAULT_BUFFER_SIZE: usize = 16384;
@@ -53,8 +54,12 @@ pub struct Connection {
     query_cache: Arc<QueryCache>,
     /// Schema manager for creating views/shadow tables
     schema_manager: SchemaManager,
+    /// Session manager for wiper cleanup
+    session_manager: Option<Arc<SessionManager>>,
     /// Session ID extracted from marlobu_session parameter
     session_id: Option<Uuid>,
+    /// Session mode (wiper or agentic)
+    session_mode: Option<SessionMode>,
     /// Schema name for this session (will be resolved from session_id)
     schema_name: Option<String>,
     /// SQL rewriter for this session
@@ -86,6 +91,7 @@ impl Connection {
         backend_addr: String,
         pool: Arc<Pool>,
         query_cache: Arc<QueryCache>,
+        session_manager: Option<Arc<SessionManager>>,
     ) -> Self {
         let schema_manager = SchemaManager::new((*pool).clone());
         Self {
@@ -95,7 +101,9 @@ impl Connection {
             pool,
             query_cache,
             schema_manager,
+            session_manager,
             session_id: None,
+            session_mode: None,
             schema_name: None,
             rewriter: None,
             client_buffer: BytesMut::with_capacity(DEFAULT_BUFFER_SIZE),
@@ -117,6 +125,18 @@ impl Connection {
             // Don't log connection reset as error
             if !is_connection_closed_error(e) {
                 error!(?peer_addr, error = %e, "Connection error");
+            }
+        }
+
+        // Wiper mode: auto-destroy session on disconnect
+        if self.session_mode == Some(SessionMode::Wiper) {
+            if let (Some(session_id), Some(ref session_manager)) =
+                (self.session_id, &self.session_manager)
+            {
+                info!(session_id = %session_id, "Wiper mode: destroying session on disconnect");
+                if let Err(e) = session_manager.destroy(session_id).await {
+                    warn!(session_id = %session_id, error = %e, "Failed to destroy wiper session");
+                }
             }
         }
 
@@ -185,6 +205,21 @@ impl Connection {
                     .and_then(|opts| extract_option_value(opts, "marlobu_session"))
             });
 
+        // Extract marlobu_mode - check direct parameter first
+        let mode_str = startup.parameters.get("marlobu_mode").cloned().or_else(|| {
+            // Check inside options parameter: "-c marlobu_mode=wiper"
+            startup
+                .parameters
+                .get("options")
+                .and_then(|opts| extract_option_value(opts, "marlobu_mode"))
+        });
+
+        // Parse mode (defaults to Agentic if not specified)
+        self.session_mode = mode_str
+            .as_ref()
+            .and_then(|s| SessionMode::from_str(s))
+            .or(Some(SessionMode::Agentic));
+
         if let Some(session_str) = session_str {
             match Uuid::parse_str(&session_str) {
                 Ok(uuid) => {
@@ -192,7 +227,12 @@ impl Connection {
                     self.session_id = Some(uuid);
                     self.rewriter = Some(Rewriter::new(&schema));
                     self.schema_name = Some(schema.clone());
-                    info!(session_id = %uuid, schema = %schema, "Session identified, rewriter initialized");
+                    info!(
+                        session_id = %uuid,
+                        schema = %schema,
+                        mode = ?self.session_mode,
+                        "Session identified, rewriter initialized"
+                    );
                 }
                 Err(e) => {
                     warn!(session = session_str, error = %e, "Invalid session UUID");
@@ -210,13 +250,15 @@ impl Connection {
         let backend = TcpStream::connect(&self.backend_addr).await?;
         self.backend = Some(backend);
 
-        // Send startup message to backend (without marlobu_session param)
+        // Send startup message to backend (without marlobu_session and marlobu_mode params)
         let mut backend_params = self.startup_params.clone();
         backend_params.remove("marlobu_session");
+        backend_params.remove("marlobu_mode");
 
-        // Also strip marlobu_session from options parameter if present
+        // Also strip marlobu_session and marlobu_mode from options parameter if present
         if let Some(opts) = backend_params.get("options").cloned() {
             let cleaned = strip_option_value(&opts, "marlobu_session");
+            let cleaned = strip_option_value(&cleaned, "marlobu_mode");
             if cleaned.trim().is_empty() {
                 backend_params.remove("options");
             } else {

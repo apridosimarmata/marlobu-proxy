@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use super::manager::{Session, SessionStatus, TableState};
+use super::manager::{Session, SessionMode, SessionStatus, TableState};
 
 #[derive(Error, Debug)]
 pub enum StoreError {
@@ -52,12 +52,24 @@ impl SessionStore {
                 CREATE TABLE IF NOT EXISTS _marlobu_sessions (
                     id UUID PRIMARY KEY,
                     project_id TEXT NOT NULL,
-                    schema_name TEXT NOT NULL UNIQUE,
+                    schema_name TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'agentic',
                     created_at TIMESTAMPTZ NOT NULL,
                     expires_at TIMESTAMPTZ NOT NULL,
                     tables JSONB NOT NULL DEFAULT '{}'
                 )
+                "#,
+                &[],
+            )
+            .await?;
+
+        // Migration: add mode column if missing (for existing installations)
+        client
+            .execute(
+                r#"
+                ALTER TABLE _marlobu_sessions
+                ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'agentic'
                 "#,
                 &[],
             )
@@ -86,18 +98,20 @@ impl SessionStore {
 
         let tables_json = serde_json::to_value(&session.tables)?;
         let status_str = session.status.as_str();
+        let mode_str = session.mode.as_str();
 
         client
             .execute(
                 r#"
-                INSERT INTO _marlobu_sessions (id, project_id, schema_name, status, created_at, expires_at, tables)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO _marlobu_sessions (id, project_id, schema_name, status, mode, created_at, expires_at, tables)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 "#,
                 &[
                     &session.id,
                     &session.project_id,
                     &session.schema_name,
                     &status_str,
+                    &mode_str,
                     &session.created_at,
                     &session.expires_at,
                     &tables_json,
@@ -141,7 +155,7 @@ impl SessionStore {
         let row = client
             .query_opt(
                 r#"
-                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                SELECT id, project_id, schema_name, status, mode, created_at, expires_at, tables
                 FROM _marlobu_sessions
                 WHERE id = $1
                 "#,
@@ -200,7 +214,7 @@ impl SessionStore {
         let rows = client
             .query(
                 r#"
-                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                SELECT id, project_id, schema_name, status, mode, created_at, expires_at, tables
                 FROM _marlobu_sessions
                 WHERE project_id = $1
                 ORDER BY created_at DESC
@@ -220,7 +234,7 @@ impl SessionStore {
         let rows = client
             .query(
                 r#"
-                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                SELECT id, project_id, schema_name, status, mode, created_at, expires_at, tables
                 FROM _marlobu_sessions
                 WHERE expires_at < $1 AND status = 'active'
                 "#,
@@ -239,7 +253,7 @@ impl SessionStore {
         let rows = client
             .query(
                 r#"
-                SELECT id, project_id, schema_name, status, created_at, expires_at, tables
+                SELECT id, project_id, schema_name, status, mode, created_at, expires_at, tables
                 FROM _marlobu_sessions
                 WHERE (expires_at < $1 AND status IN ('active', 'pending_review'))
                    OR status IN ('expired', 'rejected')
@@ -268,11 +282,13 @@ impl SessionStore {
         let project_id: String = row.get("project_id");
         let schema_name: String = row.get("schema_name");
         let status_str: String = row.get("status");
+        let mode_str: String = row.get("mode");
         let created_at: DateTime<Utc> = row.get("created_at");
         let expires_at: DateTime<Utc> = row.get("expires_at");
         let tables_json: serde_json::Value = row.get("tables");
 
         let status = SessionStatus::from_str(&status_str);
+        let mode = SessionMode::from_str(&mode_str).unwrap_or_default();
         let tables: HashMap<String, TableState> = serde_json::from_value(tables_json)?;
 
         Ok(Session {
@@ -280,6 +296,7 @@ impl SessionStore {
             project_id,
             schema_name,
             status,
+            mode,
             created_at,
             expires_at,
             tables,

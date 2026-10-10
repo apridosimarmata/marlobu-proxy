@@ -9,17 +9,38 @@ import {
 import { Marlobu, Session } from "marlobu";
 import { Pool } from "pg";
 
+// Proxy modes
+type Mode = "wiper" | "agentic";
+
+function parseMode(value: string | undefined): Mode {
+  const normalized = value?.toLowerCase();
+  if (normalized === "wiper" || normalized === "agentic") {
+    return normalized;
+  }
+  if (normalized !== undefined) {
+    console.error("Error: MARLOBU_MODE must be 'wiper' or 'agentic'");
+    process.exit(1);
+  }
+  return "agentic"; // default
+}
+
 const API_URL = process.env.MARLOBU_API_URL || "http://localhost:8080";
 const PROXY_HOST = process.env.MARLOBU_PROXY_HOST || "localhost";
 const PROXY_PORT = parseInt(process.env.MARLOBU_PROXY_PORT || "5433");
 const DATABASE = process.env.DATABASE_NAME;
 const USER = process.env.DATABASE_USER;
 const PASSWORD = process.env.DATABASE_PASSWORD;
+const MODE: Mode = parseMode(process.env.MARLOBU_MODE);
 
 if (!DATABASE || !USER || !PASSWORD) {
   console.error("Error: DATABASE_NAME, DATABASE_USER, and DATABASE_PASSWORD environment variables are required");
   process.exit(1);
 }
+
+const MODE_DESCRIPTIONS: Record<Mode, string> = {
+  wiper: "WIPER MODE: All mutations are staged in a sandbox and discarded at session end. Safe for testing.",
+  agentic: "AGENTIC MODE: All mutations are staged for human review. Use marlobu_propose to submit for approval.",
+};
 
 const client = new Marlobu({
   apiUrl: API_URL,
@@ -82,11 +103,21 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const modeInfo = MODE_DESCRIPTIONS[MODE];
+
+  const baseTools: Array<{
+    name: string;
+    description: string;
+    inputSchema: {
+      type: string;
+      properties: Record<string, unknown>;
+      required?: string[];
+    };
+  }> = [
     {
       name: "marlobu_query",
-      description: "Execute a SELECT query on the database. Returns query results.",
+      description: `Execute a SELECT query on the database. Returns query results.\n\n${modeInfo}`,
       inputSchema: {
         type: "object",
         properties: {
@@ -97,7 +128,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "marlobu_mutate",
-      description: "Execute INSERT, UPDATE, or DELETE. Changes are staged for human review, not applied immediately.",
+      description: MODE === "wiper"
+        ? `Execute INSERT, UPDATE, or DELETE. Changes are staged in sandbox and will be discarded at session end.\n\n${modeInfo}`
+        : `Execute INSERT, UPDATE, or DELETE. Changes are staged for human review, not applied immediately.\n\n${modeInfo}`,
       inputSchema: {
         type: "object",
         properties: {
@@ -106,24 +139,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["sql"],
       },
     },
-    {
-      name: "marlobu_diff",
-      description: "View all pending changes staged in the current session.",
-      inputSchema: {
-        type: "object",
-        properties: {},
-      },
+  ];
+
+  // Both modes have diff tool
+  baseTools.push({
+    name: "marlobu_diff",
+    description: `View all pending changes staged in the current session.\n\n${modeInfo}`,
+    inputSchema: {
+      type: "object",
+      properties: {},
     },
-    {
+  });
+
+  // Only include propose tool in agentic mode
+  if (MODE === "agentic") {
+    baseTools.push({
       name: "marlobu_propose",
-      description: "Submit all staged changes for human review. After proposing, no more changes can be made.",
+      description: `Submit all staged changes for human review. After proposing, no more changes can be made.\n\n${modeInfo}`,
       inputSchema: {
         type: "object",
         properties: {},
       },
-    },
-  ],
-}));
+    });
+  }
+
+  // Include discard tool in wiper mode
+  if (MODE === "wiper") {
+    baseTools.push({
+      name: "marlobu_discard",
+      description: `Discard all staged changes and reset the session. Use when you want to start fresh.\n\n${modeInfo}`,
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    });
+  }
+
+  return { tools: baseTools };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -131,7 +184,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     // Ensure session and pool exist
     if (!session || !pool) {
-      session = await client.createSession({ projectId: "claude-code" });
+      session = await client.createSession({ projectId: "claude-code", mode: MODE });
       pool = session.createPool({
         database: DATABASE,
         user: USER,
@@ -155,7 +208,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "Error: Only INSERT/UPDATE/DELETE allowed. Use marlobu_query for SELECT." }] };
         }
         const result = await pool.query(sql);
-        return { content: [{ type: "text", text: `Mutation staged: ${result.rowCount} row(s) affected` }] };
+
+        if (MODE === "wiper") {
+          return { content: [{ type: "text", text: `Mutation staged (will be discarded at session end): ${result.rowCount} row(s) affected` }] };
+        } else {
+          return { content: [{ type: "text", text: `Mutation staged for review: ${result.rowCount} row(s) affected` }] };
+        }
       }
 
       case "marlobu_diff": {
@@ -170,6 +228,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "marlobu_propose": {
+        if (MODE !== "agentic") {
+          return { content: [{ type: "text", text: `Error: Propose is only available in agentic mode. Current mode: ${MODE}` }] };
+        }
         if (!session) {
           return { content: [{ type: "text", text: "No active session. Run a mutation first." }] };
         }
@@ -183,6 +244,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `Session ${sessionId} proposed for review. Session closed.` }] };
       }
 
+      case "marlobu_discard": {
+        if (MODE !== "wiper") {
+          return { content: [{ type: "text", text: `Error: Discard is only available in wiper mode. Current mode: ${MODE}` }] };
+        }
+        if (!session) {
+          return { content: [{ type: "text", text: "No active session to discard." }] };
+        }
+        const sessionId = session.id;
+        await cleanup();
+        return { content: [{ type: "text", text: `Session ${sessionId} discarded. All staged changes removed.` }] };
+      }
+
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
     }
@@ -194,7 +267,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Marlobu MCP server running");
+  console.error(`Marlobu MCP server running in ${MODE.toUpperCase()} mode`);
 }
 
 main().catch(console.error);

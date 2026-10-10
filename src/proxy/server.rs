@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::proxy::connection::Connection;
 use crate::rewriter::QueryCache;
+use crate::session::SessionManager;
 
 /// Default query cache capacity
 const DEFAULT_CACHE_CAPACITY: usize = 10000;
@@ -21,6 +22,8 @@ pub struct ProxyServer {
     backend_addr: String,
     /// Database pool for infrastructure operations
     pool: Pool,
+    /// Session manager for wiper cleanup
+    session_manager: Arc<SessionManager>,
     /// Shutdown signal receiver
     shutdown_rx: watch::Receiver<bool>,
     /// Shared query cache
@@ -33,12 +36,14 @@ impl ProxyServer {
         listen_addr: String,
         backend_addr: String,
         pool: Pool,
+        session_manager: Arc<SessionManager>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
             listen_addr,
             backend_addr,
             pool,
+            session_manager,
             shutdown_rx,
             query_cache: Arc::new(QueryCache::new(DEFAULT_CACHE_CAPACITY)),
         }
@@ -51,6 +56,7 @@ impl ProxyServer {
 
         let backend_addr = Arc::new(self.backend_addr);
         let pool = Arc::new(self.pool);
+        let session_manager = self.session_manager;
         let query_cache = self.query_cache;
         let active_connections = Arc::new(AtomicUsize::new(0));
 
@@ -61,13 +67,20 @@ impl ProxyServer {
                         Ok((stream, peer_addr)) => {
                             let backend = Arc::clone(&backend_addr);
                             let pool = Arc::clone(&pool);
+                            let session_mgr = Arc::clone(&session_manager);
                             let cache = Arc::clone(&query_cache);
                             let active = Arc::clone(&active_connections);
 
                             active.fetch_add(1, Ordering::SeqCst);
 
                             tokio::spawn(async move {
-                                let conn = Connection::new(stream, (*backend).clone(), pool, cache);
+                                let conn = Connection::new(
+                                    stream,
+                                    (*backend).clone(),
+                                    pool,
+                                    cache,
+                                    Some(session_mgr),
+                                );
                                 if let Err(e) = conn.run().await {
                                     error!(%peer_addr, error = %e, "Connection handler error");
                                 }
@@ -124,17 +137,20 @@ impl ProxyServer {
 /// * `listen_addr` - Address to listen on (e.g., "0.0.0.0:5433")
 /// * `backend_addr` - Backend Postgres address (e.g., "localhost:5432")
 /// * `pool` - Database connection pool for infrastructure operations
+/// * `session_manager` - Session manager for wiper cleanup
 /// * `shutdown_rx` - Shutdown signal receiver
 pub async fn start_server(
     listen_addr: &str,
     backend_addr: &str,
     pool: Pool,
+    session_manager: Arc<SessionManager>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let server = ProxyServer::new(
         listen_addr.to_string(),
         backend_addr.to_string(),
         pool,
+        session_manager,
         shutdown_rx,
     );
     server.run().await

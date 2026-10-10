@@ -27,6 +27,7 @@ class Marlobu {
      *
      * @param options - Session creation options
      * @param options.projectId - Project identifier for the session
+     * @param options.mode - Proxy mode: 'wiper' or 'agentic' (default: 'agentic')
      * @returns A new Session instance
      */
     async createSession(options) {
@@ -35,7 +36,10 @@ class Marlobu {
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ project_id: options.projectId }),
+            body: JSON.stringify({
+                project_id: options.projectId,
+                ...(options.mode && { mode: options.mode }),
+            }),
         });
         if (!response.ok) {
             const body = await response.json().catch(() => ({ error: 'Unknown error' }));

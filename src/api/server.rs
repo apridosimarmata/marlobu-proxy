@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::metrics;
-use crate::session::SessionManager;
+use crate::session::{SessionManager, SessionMode};
 
 use super::handlers::{
     approve_session, create_session, delete_session, get_mutations, get_session, get_session_diff,
@@ -31,10 +31,14 @@ async fn metrics_handler() -> Response {
 }
 
 /// Build the API router with all routes
-pub fn build_router(session_manager: Arc<SessionManager>) -> Router {
+pub fn build_router(
+    session_manager: Arc<SessionManager>,
+    default_session_mode: SessionMode,
+) -> Router {
     let state = AppState {
         session_manager,
         source_schema: "public".to_string(),
+        default_session_mode,
     };
 
     Router::new()
@@ -64,7 +68,7 @@ pub async fn start_server(
     session_manager: Arc<SessionManager>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let app = build_router(session_manager);
+    let app = build_router(session_manager, config.default_mode);
 
     let listener = TcpListener::bind(&config.api_addr).await?;
     info!("API server listening on {}", config.api_addr);

@@ -21,6 +21,7 @@ export declare class Marlobu {
      *
      * @param options - Session creation options
      * @param options.projectId - Project identifier for the session
+     * @param options.mode - Proxy mode: 'wiper' or 'agentic' (default: 'agentic')
      * @returns A new Session instance
      */
     createSession(options: CreateSessionOptions): Promise<Session>;

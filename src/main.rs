@@ -75,10 +75,17 @@ async fn main() -> Result<()> {
     // Start proxy server
     let proxy_addr = config.proxy_addr.clone();
     let proxy_pool = pool.clone();
+    let proxy_session_mgr = Arc::clone(&session_manager);
     let proxy_shutdown_rx = shutdown_rx.clone();
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) =
-            proxy::start_server(&proxy_addr, &backend_addr, proxy_pool, proxy_shutdown_rx).await
+        if let Err(e) = proxy::start_server(
+            &proxy_addr,
+            &backend_addr,
+            proxy_pool,
+            proxy_session_mgr,
+            proxy_shutdown_rx,
+        )
+        .await
         {
             tracing::error!("Proxy server error: {}", e);
         }
