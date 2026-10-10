@@ -14,6 +14,17 @@ mod rewriter;
 mod sandbox;
 mod session;
 
+fn redact_url(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|mut u| {
+            if u.password().is_some() {
+                let _ = u.set_password(Some("***"));
+            }
+            u.to_string()
+        })
+        .unwrap_or_else(|_| "[invalid url]".to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -31,7 +42,7 @@ async fn main() -> Result<()> {
     tracing::info!("Starting Marlobu proxy");
     tracing::info!("Proxy listening on {}", config.proxy_addr);
     tracing::info!("API listening on {}", config.api_addr);
-    tracing::info!("Backend database: {}", config.database_url);
+    tracing::info!("Backend database: {}", redact_url(&config.database_url));
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
