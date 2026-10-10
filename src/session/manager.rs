@@ -75,6 +75,39 @@ impl SessionStatus {
     }
 }
 
+/// Session operating mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Query rewriting with propose/approve workflow (default)
+    #[default]
+    Agentic,
+    /// Query rewriting, auto-destroy on disconnect (no approval)
+    Wiper,
+}
+
+impl SessionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionMode::Agentic => "agentic",
+            SessionMode::Wiper => "wiper",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "agentic" => Some(SessionMode::Agentic),
+            "wiper" => Some(SessionMode::Wiper),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this mode requires approval workflow
+    pub fn requires_approval(&self) -> bool {
+        matches!(self, SessionMode::Agentic)
+    }
+}
+
 /// State of a table within a session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableState {
@@ -90,6 +123,7 @@ pub struct Session {
     pub project_id: String,
     pub schema_name: String,
     pub status: SessionStatus,
+    pub mode: SessionMode,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub tables: HashMap<String, TableState>,
@@ -143,14 +177,24 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Create a new session
+    /// Create a new session with default mode (Agentic)
     pub async fn create(&self, project_id: impl Into<String>) -> SessionResult<Session> {
+        self.create_with_mode(project_id, SessionMode::Agentic)
+            .await
+    }
+
+    /// Create a new session with specified mode
+    pub async fn create_with_mode(
+        &self,
+        project_id: impl Into<String>,
+        mode: SessionMode,
+    ) -> SessionResult<Session> {
         let project_id = project_id.into();
         let id = Uuid::new_v4();
-        let schema_name = format!("session_{}", id.to_string().replace('-', "_"));
         let now = Utc::now();
 
-        // Create the session schema with tracking tables
+        // Both modes use shadow tables for staging
+        let schema_name = format!("session_{}", id.to_string().replace('-', "_"));
         self.schema_manager
             .create_session_schema(&schema_name)
             .await?;
@@ -160,6 +204,7 @@ impl SessionManager {
             project_id: project_id.clone(),
             schema_name: schema_name.clone(),
             status: SessionStatus::Active,
+            mode,
             created_at: now,
             expires_at: now + Duration::seconds(self.ttl_seconds),
             tables: HashMap::new(),
@@ -172,6 +217,7 @@ impl SessionManager {
             session_id = %id,
             project_id = %project_id,
             schema = %schema_name,
+            mode = mode.as_str(),
             "Created new session"
         );
 

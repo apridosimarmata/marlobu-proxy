@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::approval::conflict::{check_row_hash_conflicts, ConflictType};
 use crate::approval::diff::{generate_session_diff, SessionDiff};
 use crate::approval::fk::{validate_fk_constraints, FkViolationType};
-use crate::session::{get_session_mutations, Session, SessionManager, SessionStatus};
+use crate::session::{get_session_mutations, Session, SessionManager, SessionMode, SessionStatus};
 
 // ============================================================================
 // Application State
@@ -25,6 +25,8 @@ pub struct AppState {
     pub session_manager: Arc<SessionManager>,
     /// Source schema for production data (default: "public")
     pub source_schema: String,
+    /// Default session mode when not specified in request
+    pub default_session_mode: SessionMode,
 }
 
 // ============================================================================
@@ -34,6 +36,7 @@ pub struct AppState {
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     pub project_id: String,
+    pub mode: Option<String>,
 }
 
 // ============================================================================
@@ -44,6 +47,7 @@ pub struct CreateSessionRequest {
 pub struct CreateSessionResponse {
     pub session_id: String,
     pub schema_name: String,
+    pub mode: String,
     pub expires_at: DateTime<Utc>,
     pub connection_string: String,
 }
@@ -54,6 +58,7 @@ pub struct SessionResponse {
     pub project_id: String,
     pub schema_name: String,
     pub status: String,
+    pub mode: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -134,9 +139,22 @@ pub async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
+    // Parse mode from request or use default
+    let mode = match &request.mode {
+        Some(mode_str) => SessionMode::from_str(mode_str).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid mode: {}. Must be 'agentic' or 'wiper'", mode_str),
+                }),
+            )
+        })?,
+        None => state.default_session_mode,
+    };
+
     let session = state
         .session_manager
-        .create(&request.project_id)
+        .create_with_mode(&request.project_id, mode)
         .await
         .map_err(|e| {
             (
@@ -152,6 +170,7 @@ pub async fn create_session(
         Json(CreateSessionResponse {
             session_id: session.id.to_string(),
             schema_name: session.schema_name.clone(),
+            mode: session.mode.as_str().to_string(),
             expires_at: session.expires_at,
             connection_string: format!(
                 "postgresql://postgres:postgres@localhost:5433/marlobu_playground?options=-c%20marlobu_session%3D{}",
@@ -180,6 +199,7 @@ pub async fn get_session(
         project_id: session.project_id.clone(),
         schema_name: session.schema_name.clone(),
         status: session.status.as_str().to_string(),
+        mode: session.mode.as_str().to_string(),
         created_at: session.created_at,
         expires_at: session.expires_at,
     }))
@@ -209,6 +229,29 @@ pub async fn propose_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Get session to check mode
+    let session = state.session_manager.get(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    // Only agentic mode supports propose/approve workflow
+    if !session.mode.requires_approval() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Propose is only available in agentic mode (current: {})",
+                    session.mode.as_str()
+                ),
+            }),
+        ));
+    }
+
     state
         .session_manager
         .update_status(id, SessionStatus::PendingReview)
@@ -247,6 +290,22 @@ pub async fn approve_session(
             );
         }
     };
+
+    // Only agentic mode supports propose/approve workflow
+    if !session.mode.requires_approval() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ErrorResponse {
+                    error: format!(
+                        "Approve is only available in agentic mode (current: {})",
+                        session.mode.as_str()
+                    ),
+                })
+                .unwrap(),
+            ),
+        );
+    }
 
     if session.status != SessionStatus::PendingReview {
         return (
