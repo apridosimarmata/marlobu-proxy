@@ -1,0 +1,22 @@
+{
+  "name": "@marlobu/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Marlobu database sandbox",
+  "main": "dist/index.js",
+  "bin": {
+    "marlobu-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "marlobu": "file:../sdks/nodejs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0"
+  }
+}
