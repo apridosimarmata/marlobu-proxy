@@ -6,7 +6,13 @@ Minimal examples showing how to integrate AI agents with Marlobu.
 
 ```bash
 # Install dependencies
-pip install marlobu openai
+pip install marlobu openai langchain langchain-openai
+
+# Set environment variables
+export DATABASE_NAME=mydb
+export DATABASE_USER=postgres
+export DATABASE_PASSWORD=your_password
+export OPENAI_API_KEY=sk-...
 
 # Start the Marlobu proxy (from repo root)
 DATABASE_URL=postgres://user:pass@localhost/mydb \
@@ -26,7 +32,7 @@ Creates a session, executes some queries, and shows the staged changes.
 ### OpenAI Agent
 
 ```bash
-OPENAI_API_KEY=sk-... python openai_agent.py
+python openai_agent.py "Refund order #102"
 ```
 
 An agent that can query and modify the database. All writes are staged for approval.
@@ -34,7 +40,7 @@ An agent that can query and modify the database. All writes are staged for appro
 ### LangChain Agent
 
 ```bash
-OPENAI_API_KEY=sk-... python langchain_agent.py
+python langchain_agent.py "Find all admin users"
 ```
 
 Same pattern using LangChain's tool abstraction.
@@ -46,3 +52,7 @@ Same pattern using LangChain's tool abstraction.
 3. Writes go to isolated shadow tables
 4. Session proposes changes for review
 5. Human approves → atomic merge to production
+
+## Security Note
+
+These examples pass SQL directly to the database for simplicity. In production, add input validation and use parameterized queries.

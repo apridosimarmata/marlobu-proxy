@@ -1,11 +1,16 @@
 """OpenAI agent with Marlobu database tools."""
 
 import json
+import os
 from openai import OpenAI
 from marlobu import Marlobu
 
 openai = OpenAI()
-marlobu = Marlobu()
+marlobu = Marlobu(
+    api_url=os.getenv("MARLOBU_API_URL", "http://localhost:8080"),
+    proxy_host=os.getenv("MARLOBU_PROXY_HOST", "localhost"),
+    proxy_port=int(os.getenv("MARLOBU_PROXY_PORT", "5433")),
+)
 
 # Define database tools
 tools = [
@@ -45,9 +50,9 @@ def run_agent(user_input: str):
 
     with marlobu.session(
         project_id="openai-agent",
-        database="mydb",
-        user="postgres",
-        password="postgres",
+        database=os.environ["DATABASE_NAME"],
+        user=os.environ["DATABASE_USER"],
+        password=os.environ["DATABASE_PASSWORD"],
     ) as session:
 
         def handle_tool(name: str, args: dict) -> str:

@@ -1,13 +1,18 @@
 """LangChain agent with Marlobu database tools."""
 
 import json
+import os
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate
 from marlobu import Marlobu
 
-marlobu = Marlobu()
+marlobu = Marlobu(
+    api_url=os.getenv("MARLOBU_API_URL", "http://localhost:8080"),
+    proxy_host=os.getenv("MARLOBU_PROXY_HOST", "localhost"),
+    proxy_port=int(os.getenv("MARLOBU_PROXY_PORT", "5433")),
+)
 session = None  # Set when running
 
 
@@ -43,9 +48,9 @@ def run_agent(user_input: str):
 
     with marlobu.session(
         project_id="langchain-agent",
-        database="mydb",
-        user="postgres",
-        password="postgres",
+        database=os.environ["DATABASE_NAME"],
+        user=os.environ["DATABASE_USER"],
+        password=os.environ["DATABASE_PASSWORD"],
     ) as sess:
         session = sess
 
