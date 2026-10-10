@@ -1,0 +1,39 @@
+FROM rust:1.75-slim as builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy src to cache dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release && rm -rf src target/release/marlobu-proxy
+
+# Copy actual source
+COPY src ./src
+
+# Build for real
+RUN cargo build --release
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -r -u 1000 -s /bin/false marlobu
+
+COPY --from=builder /app/target/release/marlobu-proxy /usr/local/bin/
+
+USER marlobu
+
+ENV RUST_LOG=marlobu_proxy=info
+ENV PROXY_ADDR=0.0.0.0:5433
+ENV API_ADDR=0.0.0.0:8080
+
+EXPOSE 5433 8080
+
+CMD ["marlobu-proxy"]
